@@ -4,6 +4,107 @@ Tinder-style swiping for Facebook Marketplace. You describe what you're hunting 
 
 Runs as a small self-hosted web app, used from your phone over a private network (e.g. Tailscale).
 
+## Getting started
+
+You need Python 3.10 or newer and a phone or browser. Nothing is spent until you add real API keys.
+
+**1. Get the code and install**
+
+```bash
+git clone https://github.com/pb-matt-mc/kindling-app.git
+cd kindling-app
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**2. Try it with fake listings (free)**
+
+```bash
+cp .env.example .env             # KINDLING_SOURCE defaults to mock when no keys are set
+python -m app.cli admin-code     # prints a one-time sign-in code
+uvicorn app.main:app --host 127.0.0.1 --port 8010
+```
+
+Open http://127.0.0.1:8010, enter the admin code, describe something you're hunting for, and start a batch. With no keys set, listings and Claude's picks are placeholders, so you can explore the whole app without spending anything.
+
+**3. Get your API keys**
+
+Real listings need two keys. Each service has its own sign-up, and their dashboards change, so follow their own docs if a screen looks different.
+
+*ScrapeCreators (finds the listings)*
+1. Create an account at [scrapecreators.com](https://scrapecreators.com).
+2. Open the dashboard and copy your API key.
+3. New accounts usually get some free credits, enough for roughly five batches. Kindling uses about 18 to 21 credits per 15-listing batch.
+
+*Anthropic API (Claude judges the listings)*
+1. Create an account at [console.anthropic.com](https://console.anthropic.com).
+2. Add billing or buy credits. The API is billed separately from a Claude.ai chat subscription, so a subscription doesn't cover it.
+3. Go to the API keys page, create a key, and copy it right away, because it's only shown once.
+4. A 15-listing batch usually costs about $0.20 of Claude. Set a monthly spend limit in the console if you want a hard ceiling.
+
+Then put both keys in `.env`:
+
+```
+KINDLING_SOURCE=scrapecreators
+SCRAPECREATORS_API_KEY=your-scrapecreators-key
+ANTHROPIC_API_KEY=your-anthropic-key
+```
+
+Restart the server after changing `.env`. While a key is missing the app shows an orange "Demo" badge (for example "Demo: fake listings, no Claude key"). When the badge is gone, you're on real data, and each batch shows the credits it used. Start with one small batch to check costs.
+
+Keep the keys private: `.env` is gitignored, so don't commit it, and don't paste keys into chats, issues or screenshots. If one leaks, delete it in that service's dashboard and make a new one.
+
+Without an Anthropic key Kindling falls back to simple keyword guessing, and without a ScrapeCreators key it uses fake listings. Both work for trying the app out.
+
+**4. Use it from your phone (Tailscale)**
+
+By default the server only listens on the machine it runs on. [Tailscale](https://tailscale.com) is a free way to make a private network between your devices, so your phone can reach the server from anywhere without exposing anything to the internet.
+
+1. **Install Tailscale** on the machine running Kindling and on your phone (downloads at [tailscale.com/download](https://tailscale.com/download), or the phone's app store).
+2. **Sign in to the same Tailscale account** on both devices. They'll appear in each other's device list.
+3. **Find the server's Tailscale address.** On the server, run `tailscale ip -4`. It prints an address like `100.x.y.z`.
+4. **Start Kindling on that address:**
+   ```bash
+   source .venv/bin/activate
+   uvicorn app.main:app --host 100.x.y.z --port 8010
+   ```
+   Use the address from step 3. Binding to it means only devices on your Tailscale network can connect.
+5. **Open it on your phone.** With Tailscale running on the phone, browse to `http://100.x.y.z:8010`.
+6. **Sign in.** On the server run `python -m app.cli admin-code` and enter the code on the phone.
+7. **Add it to your home screen** so it opens like an app. On Android Chrome use the menu, then "Add to Home screen" or "Install app". On iPhone Safari use Share, then "Add to Home Screen".
+
+Other ways to connect:
+- On a trusted home Wi-Fi you can use `--host 0.0.0.0`, then open `http://<the server's LAN IP>:8010`. Don't do this on public or shared networks.
+- **Don't expose Kindling to the public internet**, and don't use Tailscale Funnel or port forwarding. Access is by invite code only, and the app wasn't built or reviewed for hostile traffic.
+
+To let friends in, use Profile, then People, then "Invite someone". They'll need Tailscale access to your server too, for example by [sharing the device](https://tailscale.com/kb/1084/sharing) with them.
+
+**5. Keep it running (optional, Linux)**
+
+`deploy/kindling.service` is a systemd template. Replace `<USER>` and `<BIND_ADDRESS>` (your Tailscale address from step 4), and add `tailscaled.service` to the `After=` line so Tailscale is up first. Copy it to `/etc/systemd/system/` and run `sudo systemctl enable --now kindling`. Check it with `systemctl status kindling` and `journalctl -u kindling -f`.
+
+**Your data**
+
+Everything lives in the `data/` folder (SQLite database plus cached photos), created on first run. Back it up by copying that folder. Set `KINDLING_DATA_DIR` to store it elsewhere.
+
+**Heads up**
+
+Kindling gets listings through a third-party scraping service. Check that using it fits Facebook's terms and your local rules, and use it for your own personal shopping.
+
+**Troubleshooting**
+
+| Problem | What to try |
+|---|---|
+| Phone can't open the page | Check Tailscale is on for both devices, the URL uses the server's Tailscale address and port 8010, and the server is running |
+| `Address already in use` | Another program has port 8010. Use `--port 8011` (and the same port in the URL) |
+| `Cannot assign requested address` | The `--host` address isn't on this machine. Re-run `tailscale ip -4` and check Tailscale is up |
+| Orange "Demo: fake listings" badge | `KINDLING_SOURCE` isn't `scrapecreators`, or the ScrapeCreators key is missing or wrong. Restart after editing `.env` |
+| Orange "Demo: no Claude key" badge, or picks look like keyword guesses | The Anthropic key is missing or wrong. Restart after editing `.env`. If it's set, check the account has credits |
+| "You've used this week's $3.00 of Claude" | That account hit its weekly Claude cap. It resets on Monday, or raise it with "Cap" on the People card |
+| Sign-in code rejected | Codes are single-use and expire in 7 days. Make a new one with `python -m app.cli admin-code` or `invite` |
+| Lost the admin code or a phone | Run `python -m app.cli admin-code` again on the server |
+
 ## How it flows
 
 • Home: SWIPE, Your likes, Your profile. Fresh likes fly into the Likes card when you come back.
