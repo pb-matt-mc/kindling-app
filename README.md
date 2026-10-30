@@ -1,5 +1,7 @@
 # Kindling
 
+![Kindling: swipe through Facebook Marketplace finds that learn your taste](docs/social-preview.png)
+
 Tinder-style swiping for Facebook Marketplace. You describe what you're hunting for, Kindling pulls a batch of listings, Claude picks the most promising ones, and you swipe. Every swipe and every drag on the taste web teaches it, so each batch should land closer than the last.
 
 Runs as a small self-hosted web app, used from your phone over a private network (e.g. Tailscale).
