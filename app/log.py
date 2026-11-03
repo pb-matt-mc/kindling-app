@@ -1,12 +1,12 @@
-"""Logging: everything goes to the systemd journal (stderr) and to data/kindling.log (rotated)."""
+"""Logging: everything goes to the systemd journal (stderr) and to data/orbit.log (rotated)."""
 import logging
 from logging.handlers import RotatingFileHandler
 
 from . import config
 
-LOG_PATH = config.DATA_DIR / "kindling.log"
+LOG_PATH = config.DATA_DIR / "orbit.log"
 
-log = logging.getLogger("kindling")
+log = logging.getLogger("orbit")
 if not log.handlers:
     log.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")

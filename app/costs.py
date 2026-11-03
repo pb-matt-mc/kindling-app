@@ -1,14 +1,14 @@
 """Claude API spend: priced from the token counts the API reports on every call, per person, per week.
 
 Prices are USD per million tokens (Claude API pricing page, checked Oct 2026). Override with
-KINDLING_PRICES, e.g. '{"claude-sonnet-5-5": [2, 10]}', if they change or you switch models.
+ORBIT_PRICES (or the old KINDLING_PRICES), e.g. '{"claude-sonnet-5-5": [2, 10]}', if they change or you switch models.
 """
 import contextvars
 import datetime as dt
 import json
 import os
 
-from . import db
+from . import config, db
 from .log import log
 
 PRICES = {
@@ -17,9 +17,9 @@ PRICES = {
 }
 HAIKU_LONG = (0.50, 2.50)  # Haiku 5.5 prompts over 100k tokens
 try:
-    PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("KINDLING_PRICES", "{}")).items()})
+    PRICES.update({k: tuple(v) for k, v in json.loads(config.env("PRICES", "{}")).items()})
 except (ValueError, TypeError):
-    log.warning("KINDLING_PRICES isn't valid JSON; using built-in prices")
+    log.warning("ORBIT_PRICES isn't valid JSON; using built-in prices")
 
 # who the Claude calls in the current task are for: (user_id, batch_id)
 billing = contextvars.ContextVar("billing", default=(None, None))

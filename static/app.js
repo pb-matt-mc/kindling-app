@@ -4,6 +4,10 @@ import { createWeb } from "/static/web.js";
 const $ = (sel, el = document) => el.querySelector(sel);
 const h = (html) => { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstElementChild; };
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ago = (t) => {
+  const m = Math.max(0, Math.round((Date.now() / 1000 - t) / 60));
+  return m < 1 ? "just now" : m < 60 ? m + "m ago" : m < 1440 ? Math.round(m / 60) + "h ago" : Math.round(m / 1440) + "d ago";
+};
 const money = (l) => l.price_text || (l.price != null ? "$" + Math.round(l.price) : "");
 const pct = (x) => Math.round((x ?? 0) * 100) + "%";
 
@@ -69,7 +73,7 @@ async function route() {
   const r = (location.hash || "#home").slice(1);
   if (r.startsWith("join")) return renderJoin(decodeURIComponent(r.split("/")[1] || ""));
   try { await loadState(); } catch (e) { if (e.status === 401) return renderJoin(); app.innerHTML = `<div class="screen"><div class="center-state"><h2>Can't reach Kindling</h2><p>${esc(e.message)}</p><button class="btn" onclick="location.reload()">Retry</button></div></div>`; return; }
-  ({ home: renderHome, swipe: renderSwipe, likes: renderLikes, profile: renderProfile }[r] || renderHome)();
+  ({ home: renderHome, swipe: renderSwipe, likes: renderLikes, profile: renderProfile, vibe: renderVibe }[r] || renderHome)();
 }
 
 function modeBadge() {
@@ -165,7 +169,18 @@ function renderHome() {
     d.style.animationDelay = Math.random() * 3.4 + "s";
     hero.appendChild(d);
   }
-  heroFling($("#go-swipe", el), cards[1], !!cur);
+  const flingMsg = !cur ? "No batch yet. Tap to start one" : cur.status === "error" ? "That batch hit a snag. Tap to retry" : "Still brewing…";
+  // a fling while it looks like nothing's ready re-checks, so a batch that finished since this screen drew still opens
+  const recheck = !cur || cur.status === "error" ? null : async () => {
+    try {
+      const s = await loadState();
+      if (s.current?.status !== "ready") return false;
+      const left = s.current.listings.length - s.current.swiped;
+      $("#go-swipe .sub", el).textContent = left ? `${left} waiting for you` : "Batch done. See your recap";
+      return true;
+    } catch { return false; }
+  };
+  heroFling($("#go-swipe", el), cards[1], !!cur && cur.status === "ready", flingMsg, recheck);
   $("#go-likes", el).onclick = () => go("likes");
   $("#go-profile", el).onclick = () => go("profile");
   $("#pchip", el).onclick = () => go("profile");
@@ -174,9 +189,10 @@ function renderHome() {
 
 // The SWIPE card moves like a listing card: drag it, fling it past the same line in any direction
 // (left, right or up) and it flies off the same way a swiped listing does, then the batch opens.
-// Short drags spring back with the same bounce. A plain tap still opens it. With no batch to view,
-// a fling never leaves the screen: the card springs back and wiggles instead.
-function heroFling(card, next, hasBatch) {
+// Short drags spring back with the same bounce. A plain tap always opens the swipe screen (the
+// batch, the brewing view, the new-batch form or retry). A fling only succeeds when a batch is
+// ready to swipe through; otherwise the card springs back, wiggles and says why.
+function heroFling(card, next, hasBatch, blockedMsg, recheck) {
   let sx = 0, sy = 0, dx = 0, dy = 0, dragging = false, moved = false, gone = false;
   const open = () => { if (!gone) { gone = true; go("swipe"); } };
   card.onclick = (e) => { if (moved) { e.preventDefault(); return; } open(); };  // taps and keyboard
@@ -205,23 +221,30 @@ function heroFling(card, next, hasBatch) {
     if (!moved) return;  // a tap: the click handler opens it
     const side = dx > 110 ? 1 : dx < -110 ? -1 : 0;
     const up = !side && dy < -100 && Math.abs(dx) < 70;
-    if ((side || up) && !hasBatch) {
-      card.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2)";
-      card.style.transform = "";
-      card.classList.remove("shake"); void card.offsetWidth; card.classList.add("shake");
-      if (next) { next.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2), opacity .3s"; next.style.transform = ""; next.style.opacity = ""; }
-      setTimeout(() => { moved = false; }, 0);
-      return;
-    }
-    if (side || up) {
+    const flyOut = () => {
       card.style.transition = "transform .32s ease-in, opacity .32s";
       card.style.transform = side
         ? `translate(${side * window.innerWidth * 1.2}px, -40px) rotate(${side * 24}deg)`
         : `translate(${dx}px, ${-window.innerHeight}px) rotate(${dx / 18}deg)`;
       card.style.opacity = 0;
       setTimeout(open, 260);
+    };
+    if ((side || up) && !hasBatch) {
+      card.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2)";
+      card.style.transform = "";
+      card.classList.remove("shake"); void card.offsetWidth;
+      if (next) { next.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2), opacity .3s"; next.style.transform = ""; next.style.opacity = ""; }
+      setTimeout(() => { moved = false; }, 0);
+      // the fling is the check: the screen may be out of date, so ask whether the batch has finished since
+      Promise.resolve(recheck ? recheck() : false).then((ready) => {
+        if (gone) return;
+        if (ready) { hasBatch = true; flyOut(); return; }
+        card.classList.add("shake");
+        toast(blockedMsg);
+      });
       return;
     }
+    if (side || up) { flyOut(); return; }
     card.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2)";
     card.style.transform = "";
     if (next) { next.style.transition = "transform .3s cubic-bezier(.2,.9,.3,1.2), opacity .3s"; next.style.transform = ""; next.style.opacity = ""; }
@@ -520,7 +543,8 @@ function renderDeck(body, cur, queue) {
   };
 
   const decide = async (verdict, card) => {
-    if (recentlyClosed() || $("#sheet-root").childElementCount) return;
+    if (recentlyClosed() || $("#sheet-root").childElementCount || card._deciding) return;
+    card._deciding = true;  // the card stays mounted for 260ms; a second tap must not re-decide it
     const l = card._l;
     const dir = verdict === "like" ? 1 : -1;
     card.style.transition = "transform .32s ease-in, opacity .32s";
@@ -915,36 +939,215 @@ function budgetMeter(b) {
 }
 
 // ------------------------------------------------------------------ export
+// Names to leave out, from a CSV/text file: one per row, or the "Name" column if there's a header.
+function parseNameList(text, sep = ",") {
+  const rows = [];
+  let row = [], cell = "", q = false;
+  text = text.replace(/^\uFEFF/, "");
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+    else if (c === '"') q = true;
+    else if (c === sep) { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") { if (c === "\r" && text[i + 1] === "\n") i++; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += c;
+  }
+  row.push(cell); rows.push(row);
+  const full = rows.filter((r) => r.some((x) => x.trim()));
+  let col = 0;
+  const hi = full.length ? full[0].findIndex((x) => /^(name|title|listing( name)?)$/i.test(x.trim())) : -1;
+  if (hi >= 0) { col = hi; full.shift(); }
+  return [...new Set(full.map((r) => (r[col] || "").trim()).filter(Boolean))];
+}
+
 function exportDialog(batchId, keepers = false) {
   const q = keepers ? "keepers=true&" : batchId ? `batch_id=${batchId}&` : "";
   const back = h(`<div class="backdrop" style="z-index:74"></div>`);
   const dlg = h(`<div class="dialog">
-    <h3>Export ${keepers ? "your keepers" : batchId ? "this batch" : "your web"}</h3>
-    <p>Name, link, price, top 5 qualities, your ranking, your call, and Claude's expected approval. Best-ranked first.</p>
-    <div style="display:grid;gap:8px">
-      <button class="btn primary" id="ex-copy">Copy for Google Sheets</button>
-      <a class="btn" id="ex-xlsx" style="text-align:center;text-decoration:none" href="/api/export?${q}fmt=xlsx" download>Download Excel, with photos</a>
-      <a class="btn" id="ex-csv" style="text-align:center;text-decoration:none" href="/api/export?${q}fmt=csv" download>Download CSV</a>
+    <div class="dlg-head">
+      <h3>Export ${keepers ? "your keepers" : batchId ? "this batch" : "your web"}</h3>
+      <div class="tabs" style="margin:0"><button class="on" data-t="new">New</button><button data-t="upd">Update</button><button data-t="avail">Availability</button></div>
+      <div id="ex-status" class="ex-status" hidden></div>
     </div>
-    <p class="mode-note" style="margin:10px 0 0">Copy, then paste into cell A1 of a sheet. It lands in columns. Photos only come along in the Excel file.</p>
+    <div id="ex-new">
+      <details><summary>What's included</summary>
+        <p class="mode-note">Name, link, price, top 5 qualities, your ranking, your call, and Claude's expected approval, best-ranked first. The Excel file also has each listing's area and drive distance and time from your profile address, and is the only one with photos. Copy, then paste into cell A1 of a sheet.</p></details>
+      <div class="stack">
+        <button class="btn primary xact" id="ex-copy">Copy for Google Sheets</button>
+        <a class="btn xact btn-link" id="ex-xlsx" href="/api/export?${q}fmt=xlsx" download>Download Excel, with photos</a>
+        <a class="btn xact btn-link" id="ex-csv" href="/api/export?${q}fmt=csv" download>Download CSV</a>
+      </div>
+      <div class="field-group"><textarea id="ex-skiptext" rows="2" placeholder="Leave some out: paste names here, one per line"></textarea>
+        <div class="field-foot"><label class="btn ghost">Or upload a file<input type="file" id="ex-skipfile" accept=".csv,.txt,text/csv,text/plain" hidden></label>
+        <span class="mode-note" id="ex-skipnote">Those listings are left out; everything else is exported.</span></div></div>
+    </div>
+    <div id="ex-upd" hidden>
+      <p>Get only the listings that aren't in an earlier export, so you can add them to the same sheet.</p>
+      <label class="mode-note" for="ex-type" style="display:block;margin:0 0 4px">Your original export was</label>
+      <select id="ex-type"><option value="sheets">Copy for Google Sheets</option><option value="xlsx">Excel, with photos</option><option value="csv">CSV</option></select>
+      <div class="stack two">
+        <button class="btn primary xact" id="up-copy">Copy to update</button>
+        <a class="btn xact btn-link" id="up-dl" href="#" download>Download to update</a>
+      </div>
+      <div class="field-group"><textarea id="up-text" rows="3"></textarea>
+        <div class="field-foot"><label class="btn ghost">Or upload the original<input type="file" id="up-file" hidden></label>
+        <span class="mode-note" id="up-note"></span></div></div>
+    </div>
+    <div id="ex-av" hidden>
+      <p>Paste an exported column of listing links (best) or names, in your sheet's order. You get one answer per row, same order: Available, Unavailable or Failed to find. Paste it into a new column.</p>
+      <textarea id="av-text" rows="4" placeholder="Paste the Link column (or the Name column) here, one per line"></textarea>
+      <span class="mode-note" id="av-note" style="display:block;margin:6px 0 10px"></span>
+      <button class="btn primary xact" id="av-copy" style="width:100%">Copy availability</button>
+      <details style="margin-top:10px"><summary>How it works</summary>
+        <p class="mode-note">Links are safest: they identify the exact listing. Names only work for listings your app has seen. This asks Facebook for each listing, so it uses a few credits (shown when done). A listing that's been removed may show as Failed to find.</p></details>
+    </div>
     <div class="row"><button class="btn ghost" id="ex-x">Close</button></div></div>`);
   const done = () => { back.remove(); dlg.remove(); };
   document.body.append(back, dlg);
   back.onclick = done;
   $("#ex-x", dlg).onclick = done;
-  $("#ex-csv", dlg).addEventListener("click", () => setTimeout(done, 300));
-  $("#ex-xlsx", dlg).addEventListener("click", () => setTimeout(done, 300));
-  $("#ex-copy", dlg).onclick = async () => {
-    try {
-      const res = await fetch(`/api/export?${q}fmt=tsv`);
-      const text = await res.text();
-      await navigator.clipboard.writeText(text);
-      toast(`Copied ${text.split("\n").length - 1} rows. Paste into A1.`);
-      done();
-    } catch (e) {
-      toast("Couldn't copy here. Use Download CSV instead.");
-    }
+
+  // New: names to leave out. Update: names found in the original export. Each tab keeps its own.
+  let tab = "new", skipNew = [], skipOld = [];
+  const exclude = () => (tab === "new" ? skipNew : skipOld);
+  const doFetch = (url, ex = exclude()) => ex.length
+    ? fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ exclude: ex }) })
+    : fetch(url);
+  dlg.querySelectorAll(".tabs button").forEach((b) => (b.onclick = () => {
+    tab = b.dataset.t;
+    dlg.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
+    $("#ex-new", dlg).hidden = tab !== "new";
+    $("#ex-upd", dlg).hidden = tab !== "upd";
+    $("#ex-av", dlg).hidden = tab !== "avail";
+  }));
+  // Availability tab: lines stay in place (blank rows too) so the answers line up with the sheet
+  const avLines = () => $("#av-text", dlg).value.replace(/\s+$/, "").split(/\r?\n/).map((s) => s.trim());
+  $("#av-text", dlg).oninput = () => {
+    const n = avLines().filter(Boolean).length;
+    $("#av-note", dlg).textContent = n ? `${n} listing${n === 1 ? "" : "s"} to check.` : "";
   };
+
+  // New tab: the box is line-based, each line one whole name (commas stay part of the name)
+  const setSkip = (text) => {
+    skipNew = [...new Set(text.split(/\r?\n/).map((s) => s.trim().replace(/^"(.*)"$/, "$1").trim()).filter(Boolean))];
+    $("#ex-skipnote", dlg).textContent = skipNew.length ? `Leaving out ${skipNew.length} name${skipNew.length === 1 ? "" : "s"}.` : "Those listings are left out; everything else is exported.";
+  };
+  $("#ex-skiptext", dlg).oninput = (e) => setSkip(e.target.value);
+  $("#ex-skipfile", dlg).onchange = async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    // a CSV file is read by column, then shown in the box one name per line
+    const text = parseNameList(await f.text()).join("\n");
+    $("#ex-skiptext", dlg).value = text;
+    setSkip(text);
+  };
+
+  // Update tab: read the original export in whatever form it was made
+  const type = () => $("#ex-type", dlg).value;
+  const upNote = () => ($("#up-note", dlg).textContent = skipOld.length ? `${skipOld.length} original listing${skipOld.length === 1 ? "" : "s"} found.` : "");
+  const readPasted = () => {
+    const t = $("#up-text", dlg).value;
+    skipOld = type() === "csv" ? parseNameList(t) : parseNameList(t, "\t");  // cells copied from Sheets or Excel paste tab-separated
+    upNote();
+  };
+  const setType = () => {
+    const t = type();
+    $("#up-text", dlg).placeholder = t === "sheets" ? "Paste the sheet here (select all in Google Sheets, copy, paste). The Name column is read."
+      : t === "csv" ? "Paste the CSV text here, or upload the file. The Name column is read."
+      : "Paste the cells copied from Excel here (select all, copy, paste), or upload the .xlsx file. The Name column is read.";
+    $("#up-file", dlg).accept = t === "xlsx" ? ".xlsx" : ".csv,.tsv,.txt,text/csv,text/plain";
+    $("#up-dl", dlg).href = `/api/export?${q}fmt=${t === "xlsx" ? "xlsx" : "csv"}`;
+    $("#up-text", dlg).value = ""; skipOld = []; upNote();
+  };
+  $("#ex-type", dlg).onchange = setType;
+  $("#up-text", dlg).oninput = readPasted;
+  $("#up-file", dlg).onchange = async (e) => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      if (type() === "xlsx") {
+        const res = await fetch("/api/export/names", { method: "POST", body: await f.arrayBuffer() });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "couldn't read it");
+        skipOld = (await res.json()).names;
+      } else {
+        const text = await f.text();
+        $("#up-text", dlg).value = text;
+        skipOld = parseNameList(text, /\t/.test(text.split("\n")[0]) ? "\t" : ",");
+      }
+      upNote();
+    } catch (err) { toast("Couldn't read that file: " + err.message); }
+  };
+  setType();
+  const needOriginal = () => {
+    if (tab === "upd" && !skipOld.length) { toast("Paste or upload your original export first."); return true; }
+    return false;
+  };
+
+  // One export at a time, but the rest of the dialog stays usable while it's prepared.
+  // Status line at the top shows what's running; settings are read when the button is tapped.
+  const status = (msg, working) => {
+    const el = $("#ex-status", dlg);
+    el.hidden = !msg;
+    el.textContent = msg || "";
+    el.classList.toggle("working", !!working);
+  };
+  const run = async (el, msg, job) => {
+    if (dlg.classList.contains("busy") || needOriginal()) return;
+    const label = el.textContent;
+    dlg.classList.add("busy"); el.classList.add("working");
+    el.textContent = "Preparing…";
+    status(msg, true);
+    try { status(await job() || "", false); }
+    catch (err) { status("", false); toast("Export failed: " + err.message); }
+    dlg.classList.remove("busy"); el.classList.remove("working"); el.textContent = label;
+  };
+  // fetch first, so a server error shows as a message instead of being saved as the file
+  const download = (el) => el.addEventListener("click", (e) => {
+    e.preventDefault();
+    const isX = el.id === "ex-xlsx" || (el.id === "up-dl" && type() === "xlsx");
+    const ex = exclude().slice();
+    run(el, isX ? "Building your Excel file with photos… this can take a minute. You can keep editing." : "Building your file…", async () => {
+      const res = await doFetch(el.getAttribute("href"), ex);
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "export failed");
+      const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "")?.[1] || "kindling-export";
+      const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(await res.blob()), download: name });
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      return `Done: ${name} downloaded${ex.length ? `, ${res.headers.get("X-Excluded") || 0} left out` : ""}.`;
+    });
+  });
+  download($("#ex-csv", dlg));
+  download($("#ex-xlsx", dlg));
+  download($("#up-dl", dlg));
+  const copy = (e) => {
+    const upd = tab === "upd", like = upd && type() === "xlsx", ex = exclude().slice();
+    run(e.currentTarget, "Preparing your copy…" + (like ? " This can take a minute." : ""), async () => {
+      const res = await doFetch(`/api/export?${q}fmt=tsv${upd ? "&bare=1" + (like ? "&like=xlsx" : "") : ""}`, ex);
+      if (!res.ok) throw new Error("export failed");
+      const text = await res.text();
+      if (upd && !text.trim()) return "Nothing new: every listing is already in your original.";
+      try { await navigator.clipboard.writeText(text); }
+      catch { throw new Error("couldn't copy here. Use Download instead."); }
+      const n = text.split("\n").length - (upd ? 0 : 1);
+      return `Copied ${n} row${n === 1 ? "" : "s"}${ex.length ? `, ${res.headers.get("X-Excluded") || 0} left out` : ""}. ${upd ? "Paste in the first empty row, column A." : "Paste into A1."}`;
+    });
+  };
+  $("#av-copy", dlg).onclick = (e) => {
+    const lines = avLines();
+    if (!lines.some(Boolean)) { toast("Paste your listing links or names first."); return; }
+    run(e.currentTarget, `Checking ${lines.filter(Boolean).length} listings… this can take a minute. You can keep editing.`, async () => {
+      const res = await fetch("/api/export/availability", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ lines }) });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "check failed");
+      const { results, credits } = await res.json();
+      try { await navigator.clipboard.writeText(results.join("\n")); }
+      catch { throw new Error("couldn't copy here."); }
+      const c = (w) => results.filter((x) => x === w).length;
+      return `Copied ${results.length} answers: ${c("Available")} available, ${c("Unavailable")} unavailable, ${c("Failed to find")} not found. Used ${credits} credit${credits === 1 ? "" : "s"}. Paste into a new column.`;
+    });
+  };
+  $("#ex-copy", dlg).onclick = copy;
+  $("#up-copy", dlg).onclick = copy;
 }
 
 // ------------------------------------------------------------------ batch dashboard
@@ -1095,15 +1298,30 @@ async function paintKeepers(box) {
     return;
   }
   box.innerHTML = `<div class="keeper-head"><span>${ks.length} keeper${ks.length > 1 ? "s" : ""}</span>
-    <button class="btn" id="kexport"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Export</button></div>
+    <span class="khbtns"><button class="btn" id="kcheck">Check availability</button>
+    <button class="btn" id="kexport"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Export</button></span></div>
+    <div class="keeper-note" id="knote"></div>
     <div class="keeper-grid"></div>`;
   $("#kexport", box).onclick = () => exportDialog(null, true);
+  $("#kcheck", box).onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "Checking…";
+    try {
+      const r = await api("/keepers/check", { method: "POST", body: {} });
+      await paintKeepers(box);
+      const bits = [`${r.live} still available`, `${r.gone} gone`];
+      if (r.unknown) bits.push(`${r.unknown} couldn't be checked`);
+      if (r.changed) bits.push(`${r.changed} changed price`);
+      $("#knote", box).textContent = bits.join(" · ") + (r.credits ? ` · ${r.credits} credit${r.credits > 1 ? "s" : ""}` : "");
+    } catch (err) { toast(err.message); btn.disabled = false; btn.textContent = "Check availability"; }
+  };
   const grid = $(".keeper-grid", box);
   ks.forEach((k) => {
-    const card = h(`<div class="keeper">
+    const card = h(`<div class="keeper${k.avail === "gone" ? " gone" : ""}">
       <button class="kph"></button>
       <div class="kbody"><div class="kt">${esc(k.title)}</div>
-        <div class="kp">${esc(money(k))} <span>${esc(k.location_text || "")}</span></div>
+        <div class="kp">${esc(money(k))}${k.price_prev != null ? ` <s class="kprev">${esc("$" + Number(k.price_prev).toLocaleString())}</s>` : ""} <span>${esc(k.location_text || "")}</span></div>
+        ${k.avail ? `<div class="kavail ${k.avail}">${k.avail === "live" ? "Still available" : "No longer available"} <span>· ${esc(ago(k.avail_at))}</span></div>` : ""}
         <div class="krow"><a class="btn primary" href="${esc(k.url)}" target="_blank" rel="noopener">Open</a>
           <button class="btn ghost kx" aria-label="Remove keeper">✕</button></div></div></div>`);
     if (k.photos?.[0]) $(".kph", card).style.backgroundImage = `url(${k.photos[0]})`;
@@ -1413,15 +1631,18 @@ function weekBars(box, title, series, key, color, fmt) {
 async function renderProfile() {
   const p = S.state.profile;
   const me = S.state.me, isAdmin = me.role === "admin";
-  const [profiles, ins, batches, logs, people, spend] = await Promise.all([api("/profiles"), api("/insights"), api("/batches"),
+  const [profiles, ins, batches, logs, people, spend, vibe] = await Promise.all([api("/profiles"), api("/insights"), api("/batches"),
     isAdmin ? api("/logs?n=20").catch(() => ({ entries: [] })) : null,
-    isAdmin ? api("/admin/users").catch(() => []) : null, api("/spending").catch(() => null)]);
+    isAdmin ? api("/admin/users").catch(() => []) : null, api("/spending").catch(() => null),
+    api("/vibe/" + p.id).catch(() => ({ status: "none" }))]);
   const kmToMi = (k) => Math.round(k * 0.621371);
   const el = h(`<div class="screen scroll">
     <div class="topbar"><button class="icon-btn" id="back">${I.back}</button><h1>Your profile</h1>${modeBadge()}</div>
     <div class="profiles-row" style="margin-top:10px">
       ${profiles.map((x) => `<button data-p="${x.id}" class="${x.active ? "on" : ""}">${esc(x.name)}</button>`).join("")}
       <button id="newp">+ New hunt</button></div>
+    ${!["none", "applied"].includes(vibe.status) ? `<button class="card-block vibe-banner" id="go-vibe"><b>Finish setting up this vibe hunt</b>
+      <span class="mode-note">${vibe.status === "refined" ? "Your sharpened hunt is waiting" : vibe.status === "hone" ? "Your hone grid is waiting" : vibe.status === "drafted" ? "Your hunt is drafted" : "Pick up where you left off"}</span></button>` : ""}
 
     <div class="card-block" data-sec="hunt"><h3>What you're hunting for</h3>
       <div class="field"><label>Name</label><input id="f-name" value="${esc(p.name)}" maxlength="40"></div>
@@ -1547,16 +1768,18 @@ async function renderProfile() {
   }
 
   let criteria = [...(p.criteria || [])];
+  let must = new Set((p.must_have || []).map((m) => m.toLowerCase()));
   let loc = { location_name: p.location_name, lat: p.lat, lng: p.lng, location_slug: p.location_slug };
   const paintCrit = () => {
-    $("#crit", el).innerHTML = criteria.map((c, i) => `<span class="chip">${esc(c)}<button data-i="${i}">✕</button></span>`).join("")
-      || '<span class="empty">Nothing yet. Add the must-haves you want checked.</span>';
-    $("#crit", el).querySelectorAll("button").forEach((b) => (b.onclick = () => { criteria.splice(+b.dataset.i, 1); paintCrit(); }));
+    $("#crit", el).innerHTML = criteria.map((c, i) => `<span class="chip${must.has(c.toLowerCase()) ? " must" : ""}">${esc(c)}<button class="must-btn" data-m="${i}" aria-pressed="${must.has(c.toLowerCase())}" title="A no on a must have removes the listing">${must.has(c.toLowerCase()) ? "Must have" : "Nice to have"}</button><button data-i="${i}" aria-label="Remove ${esc(c)}">✕</button></span>`).join("")
+      || '<span class="empty">Nothing yet. Add what you want checked, then mark the ones a listing must have.</span>';
+    $("#crit", el).querySelectorAll("button[data-i]").forEach((b) => (b.onclick = () => { must.delete(criteria[+b.dataset.i].toLowerCase()); criteria.splice(+b.dataset.i, 1); paintCrit(); }));
+    $("#crit", el).querySelectorAll("button[data-m]").forEach((b) => (b.onclick = () => { const k = criteria[+b.dataset.m].toLowerCase(); must.has(k) ? must.delete(k) : must.add(k); paintCrit(); }));
   };
   paintCrit();
   const addCrit = () => { const v = $("#f-crit", el).value.trim(); if (v) { criteria.push(v); $("#f-crit", el).value = ""; paintCrit(); } };
   $("#add-crit", el).onclick = addCrit;
-  $("#f-crit", el).onkeydown = (e) => e.key === "Enter" && addCrit();
+  $("#f-crit", el).onkeydown = (e) => { if (e.key === "Enter") addCrit(); };
   $("#f-rad", el).oninput = (e) => ($("#radv", el).textContent = kmToMi(+e.target.value) + " mi");
   $("#find", el).onclick = async () => {
     try {
@@ -1571,22 +1794,43 @@ async function renderProfile() {
       }));
     } catch (e) { toast(e.message); }
   };
+  $("#f-loc", el).onkeydown = (e) => { if (e.key === "Enter") $("#find", el).click(); };
   $("#save", el).onclick = async () => {
     const num = (v) => (v.trim() === "" ? null : Number(v.replace(/[^0-9.]/g, "")));
     try {
+      // typed a place but never picked a Find result: look it up now so the edit actually sticks
+      const typed = $("#f-loc", el).value.trim();
+      if (typed && typed !== loc.location_name) {
+        const [l] = await api("/locate", { body: { text: typed } });
+        if (!l) { toast(`Couldn't find "${typed}". Try a city or ZIP`); return; }
+        loc = { location_name: l.name, lat: l.lat ?? loc.lat, lng: l.lng ?? loc.lng, location_slug: l.slug || loc.location_slug };
+        $("#f-loc", el).value = l.name;
+        $("#coords", el).textContent = `${(+loc.lat).toFixed(3)}, ${(+loc.lng).toFixed(3)}`;
+      }
       await api("/profiles/" + p.id, { method: "PUT", body: {
-        name: $("#f-name", el).value.trim() || p.name, hunt: $("#f-hunt", el).value.trim(), criteria,
+        name: $("#f-name", el).value.trim() || p.name, hunt: $("#f-hunt", el).value.trim(), criteria, must_have: criteria.filter((c) => must.has(c.toLowerCase())),
         min_price: num($("#f-min", el).value), max_price: num($("#f-max", el).value),
         radius_km: +$("#f-rad", el).value, ...loc } });
       toast("Saved. Next batch uses this.");
     } catch (e) { toast(e.message); }
   };
   el.querySelectorAll("[data-p]").forEach((b) => (b.onclick = async () => { await api(`/profiles/${b.dataset.p}/activate`, { body: {} }); route(); }));
-  $("#newp", el).onclick = async () => {
-    const name = prompt("What are you hunting for next? (e.g. Coffee table)");
-    if (!name) return;
-    await api("/profiles", { body: { name, hunt: name } });
-    route();
+  $("#go-vibe", el)?.addEventListener("click", () => go("vibe"));
+  $("#newp", el).onclick = () => {
+    const c = h(`<div><h2>New hunt</h2>
+      <div class="field"><label>What should we call it?</label><input id="nh-name" maxlength="40" placeholder="Coffee table, or Cozy reading nook"></div>
+      <div style="display:grid;gap:8px;margin-top:6px">
+        <button class="big-btn" id="nh-item" style="flex:none">A specific item<small>You know what you're after</small></button>
+        <button class="big-btn" id="nh-vibe" style="flex:none">A vibe<small>A feeling, not an object. Add photos, links or a description and Claude helps write the hunt</small></button>
+      </div></div>`);
+    openSheet(c);
+    const create = async (hunt) => {
+      const name = $("#nh-name", c).value.trim();
+      if (!name) { toast("Give it a name first"); $("#nh-name", c).focus(); return null; }
+      return api("/profiles", { body: { name, hunt: hunt ? name : "" } });
+    };
+    $("#nh-item", c).onclick = async () => { if (await create(true)) { closeSheet(); route(); } };
+    $("#nh-vibe", c).onclick = async () => { if (await create(false)) { closeSheet(); go("vibe"); } };
   };
 
   // trait bars
@@ -1655,4 +1899,292 @@ route();
 
 if ("serviceWorker" in navigator && window.isSecureContext) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
+
+// ------------------------------------------------------------------ vibe hunts
+// Start a hunt from a feeling: references in, a drafted hunt out, then an optional one-time "hone" where
+// real listings (one per way the vibe could be read) get a like, love or hate and a reason.
+function vibeIcons() {
+  return {
+    up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 11v9H4v-9h3zM7 11l4-8c1.7 0 2.7 1.3 2.4 3L13 9h5.3a2 2 0 011.97 2.35l-1.1 6.5A2.5 2.5 0 0116.7 20H7"/></svg>',
+    heart: I.heart,
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>',
+  };
+}
+
+async function fileToJpeg(file, max = 1024) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
+  c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.85);
+}
+
+async function renderVibe() {
+  const pid = S.state.profile.id;
+  let v = await api("/vibe/" + pid);
+  if (v.status === "none") v = await api("/vibe/" + pid, { method: "PUT", body: { text: "" } });
+  paintVibe(v);
+}
+
+function vibeShell(title, back) {
+  const el = h(`<div class="screen scroll vibe">
+    <div class="topbar"><button class="icon-btn" id="vback">${I.back}</button><h1>${esc(title)}</h1>${modeBadge()}</div>
+    <div class="vbody"></div></div>`);
+  $("#vback", el).onclick = back || (() => go("profile"));
+  app.replaceChildren(el);
+  return $(".vbody", el);
+}
+
+function paintVibe(v) {
+  clearInterval(S.poll); S.poll = null;
+  const pid = S.state.profile.id;
+  if (["analyzing", "fetching", "refining"].includes(v.status)) return vibeBusy(v, pid);
+  if (v.status === "inputs" || v.edit) return vibeInputs(v, pid);
+  if (v.status === "drafted") return vibeDraft(v, pid);
+  if (v.status === "hone") return vibeHone(v, pid);
+  return vibeResult(v, pid);
+}
+
+function vibeBusy(v, pid) {
+  const body = vibeShell("Vibe hunt", () => go("profile"));
+  const what = { analyzing: "Reading your references", fetching: "Finding listings to hone with", refining: "Sharpening your hunt" }[v.status];
+  const note = { analyzing: "Claude is looking at everything you gave it and listing every way the vibe could be read.",
+    fetching: "Searching Marketplace for each reading, then picking the best example of each. This can take a minute or two.",
+    refining: "Folding your reactions into the hunt." }[v.status];
+  body.replaceChildren(h(`<div class="center-state" style="min-height:70vh;min-height:70dvh"><div class="flame">${I.flame}</div>
+    <h2>${what}</h2><p id="vprog">${esc(v.progress || "Getting started")}</p><p style="font-size:13px">${note} You can leave, it keeps going.</p></div>`));
+  S.poll = setInterval(async () => {
+    try {
+      const nv = await api("/vibe/" + pid);
+      if (nv.status !== v.status) { if (nv.error) toast(nv.error); paintVibe(nv); }
+      else $("#vprog") && ($("#vprog").textContent = nv.progress || "");
+    } catch {}
+  }, 1500);
+}
+
+function vibeErr(v) { return v.error ? `<div class="vibe-err">${esc(v.error)}</div>` : ""; }
+
+function vibeInputs(v, pid) {
+  const body = vibeShell("Describe the vibe", v.edit ? () => paintVibe({ ...v, edit: false }) : () => go("profile"));
+  const render = (cur) => {
+    v = { ...cur, edit: v.edit };
+    const srcs = v.sources.map((s) => `<div class="vsrc" data-id="${s.id}">
+      <div class="vthumb" style="background-image:url(${s.images[0] || ""})">${s.images.length > 1 ? `<i>${s.images.length}</i>` : ""}</div>
+      <div class="vlabel"><b>${esc(s.label)}</b><span class="mode-note">${{ image: "Photo", listing: "Marketplace listing", pin: "Pinterest pin", board: "Pinterest board" }[s.kind]}${s.images.length > 1 ? ` · ${s.images.length} pictures` : ""}</span></div>
+      <button class="icon-btn vx" aria-label="Remove">${I.x}</button></div>`).join("");
+    $(".vbody", app).innerHTML = `
+      ${vibeErr(v)}
+      <p class="mode-note" style="margin:10px 2px">Give Claude anything that shows the feeling. It will list every way that vibe could turn into something you can buy, then draft your hunt.</p>
+      <div class="card-block"><h3>In words</h3>
+        <div class="field" style="margin:0"><textarea id="v-text" rows="4" placeholder="e.g. I want a pop of color in my living room, or I'm into wall-mounted decor">${esc(v.text)}</textarea></div></div>
+      <div class="card-block"><h3>Photos, listings and boards</h3>
+        <div class="vsrcs">${srcs || '<p class="empty">Nothing added yet.</p>'}</div>
+        <div class="inline" style="margin-top:10px"><input id="v-link" placeholder="Paste a Facebook listing, Pinterest pin or public board link" inputmode="url"><button class="btn" id="v-addlink">Add</button></div>
+        <label class="btn vfile" for="v-file" style="margin-top:8px">Add photos (${v.images_left} left)</label>
+        <input id="v-file" type="file" accept="image/*" multiple hidden>
+        <p class="mode-note" style="margin-top:8px">Pinterest boards have to be public. For anything else, add a screenshot as a photo. Everything here is sent to Claude to read.</p></div>
+      <button class="big-btn" id="v-go" style="margin-top:14px;flex:none">${v.readings.length ? "Redo my hunt" : "Write my hunt"}<small>Claude reads it all and drafts the hunt</small></button>`;
+    wire();
+  };
+  const busy = async (btn, label, fn) => {
+    const old = btn.textContent; btn.disabled = true; btn.textContent = label;
+    try { await fn(); } catch (e) { if (!e.handled) toast(e.message); }
+    btn.disabled = false; btn.textContent = old;
+  };
+  const wire = () => {
+    const b = $(".vbody", app);
+    const text = () => $("#v-text", b).value;
+    $("#v-text", b).onblur = () => api("/vibe/" + pid, { method: "PUT", body: { text: text() } }).catch(() => {});
+    b.querySelectorAll(".vsrc .vx").forEach((x) => (x.onclick = async () => {
+      const t = text();
+      render(await api(`/vibe/${pid}/source/${x.closest(".vsrc").dataset.id}`, { method: "DELETE" }));
+      $("#v-text", b).value = t;
+    }));
+    const addLink = () => busy($("#v-addlink", b), "Fetching…", async () => {
+      const url = $("#v-link", b).value.trim();
+      if (!url) return;
+      const t = text();
+      const nv = await api(`/vibe/${pid}/link`, { body: { url } });
+      render(nv); $("#v-text", $(".vbody", app)).value = t;
+    });
+    $("#v-addlink", b).onclick = addLink;
+    $("#v-link", b).onkeydown = (e) => { if (e.key === "Enter") addLink(); };
+    $("#v-file", b).onchange = async (e) => {
+      const files = [...e.target.files]; e.target.value = "";
+      const lbl = $(".vfile", b); lbl.textContent = "Adding…";
+      const t = text(); let nv = null;
+      for (const f of files) {
+        try { nv = await api(`/vibe/${pid}/image`, { body: { data: await fileToJpeg(f) } }); }
+        catch (err) { toast(err.message); break; }
+      }
+      render(nv || v); $("#v-text", $(".vbody", app)).value = t;
+    };
+    $("#v-go", b).onclick = () => busy($("#v-go", b), "Starting…", async () => {
+      const nv = await api(`/vibe/${pid}/analyze`, { body: { text: text() } });
+      paintVibe(nv);
+    });
+  };
+  render(v);
+}
+
+// the editable hunt (text, checklist, budget) used for both the draft and the sharpened result
+function huntEditor(d) {
+  const crit = [...(d.criteria || [])];
+  const el = h(`<div>
+    <div class="field"><label>The hunt</label><textarea id="he-hunt" rows="5">${esc(d.hunt)}</textarea></div>
+    <div class="field"><label>Checklist (shows up on every card)</label><div class="chips left" id="he-crit"></div>
+      <div class="inline"><input id="he-add" placeholder="Add a checklist item"><button class="btn" id="he-addb">Add</button></div></div>
+    <div class="two"><div class="field"><label>Min price</label><input id="he-min" inputmode="numeric" value="${d.min_price ?? ""}" placeholder="$"></div>
+      <div class="field"><label>Max price</label><input id="he-max" inputmode="numeric" value="${d.max_price ?? ""}" placeholder="$"></div></div></div>`);
+  const paint = () => {
+    $("#he-crit", el).innerHTML = crit.map((c, i) => `<span class="chip mod">${esc(c)}<button data-i="${i}" aria-label="Remove">×</button></span>`).join("")
+      || '<span class="empty">None yet</span>';
+    el.querySelectorAll("#he-crit button").forEach((b) => (b.onclick = () => { crit.splice(+b.dataset.i, 1); paint(); }));
+  };
+  const add = () => { const v = $("#he-add", el).value.trim(); if (v) { crit.push(v); $("#he-add", el).value = ""; paint(); } };
+  $("#he-addb", el).onclick = add;
+  $("#he-add", el).onkeydown = (e) => { if (e.key === "Enter") add(); };
+  paint();
+  const num = (x) => (x.trim() === "" ? null : Number(x.replace(/[^0-9.]/g, "")));
+  return { el, read: () => ({ hunt: $("#he-hunt", el).value.trim(), criteria: crit, min_price: num($("#he-min", el).value), max_price: num($("#he-max", el).value) }) };
+}
+
+function vibeDraft(v, pid) {
+  const body = vibeShell("Your drafted hunt");
+  const ed = huntEditor(v.draft);
+  body.append(h(`<div>${vibeErr(v)}${v.draft.summary ? `<div class="take" style="margin-top:10px">${esc(v.draft.summary)}</div>` : ""}</div>`));
+  const card = h(`<div class="card-block"><h3>Edit anything you like</h3></div>`);
+  card.append(ed.el);
+  body.append(card);
+  body.append(h(`<details class="card-block vread"><summary><b>How I read your vibe</b> · ${v.readings.length} ways</summary>
+    <p class="mode-note" style="margin:8px 0 0">Not what you meant? Tap the × and Claude drops it from your hone and steers away from it.</p>
+    ${v.readings.map((r) => `<div class="vr" data-id="${r.id}"><div style="flex:1;min-width:0"><b>${esc(r.label)}</b>${r.note ? `<span class="mode-note"> ${esc(r.note)}</span>` : ""}<div class="mode-note">searches "${esc(r.query)}"</div></div>
+      <button class="icon-btn vx" aria-label="Wrong reading: ${esc(r.label)}">${I.x}</button></div>`).join("")}</details>`));
+  const acts = h(`<div class="vacts">
+    ${v.honed ? "" : `<button class="big-btn" id="vhone" style="flex:none">Hone this hunt<small>Up to ${v.hone_size} real listings to react to, one per reading (a reading with nothing nearby is skipped). You get one hone per hunt</small></button>`}
+    <button class="btn" id="vuse">${v.honed ? "Use this hunt" : "Use this and skip the hone"}</button>
+    <button class="btn ghost" id="vedit">Change my references</button></div>`);
+  body.append(acts);
+  const save = () => api(`/vibe/${pid}/draft`, { method: "PUT", body: ed.read() });
+  body.querySelectorAll(".vr .vx").forEach((x) => (x.onclick = async () => {
+    const row = x.closest(".vr");
+    x.disabled = true;
+    try {
+      const nv = await api(`/vibe/${pid}/reading/${row.dataset.id}`, { method: "DELETE" });
+      v.readings = nv.readings; v.hone_size = nv.hone_size;
+      row.remove();
+      $(".vread summary").innerHTML = `<b>How I read your vibe</b> · ${nv.readings.length} ways`;
+      const sm = $("#vhone small", acts);
+      if (sm) sm.textContent = `Up to ${nv.hone_size} real listings to react to, one per reading (a reading with nothing nearby is skipped). You get one hone per hunt`;
+    } catch (err) { toast(err.message); x.disabled = false; }
+  }));
+  $("#vhone", acts) && ($("#vhone", acts).onclick = async (e) => {
+    const btn = e.currentTarget;  // currentTarget is null once the handler has awaited
+    btn.disabled = true;
+    try { await save(); paintVibe(await api(`/vibe/${pid}/hone`, { body: {} })); }
+    catch (err) { toast(err.message); btn.disabled = false; }
+  });
+  $("#vuse", acts).onclick = async () => {
+    try { await api(`/vibe/${pid}/apply`, { body: ed.read() }); toast("Hunt saved. Start a batch when you're ready."); go("home"); }
+    catch (err) { toast(err.message); }
+  };
+  $("#vedit", acts).onclick = () => paintVibe({ ...v, edit: true });
+}
+
+function vibeHone(v, pid) {
+  const body = vibeShell("Hone this hunt");
+  const icons = vibeIcons();
+  const items = v.items;
+  const skipped = v.readings.filter((r) => r.found === false).length;
+  body.append(h(`<div>${vibeErr(v)}<p class="mode-note" style="margin:10px 2px"><b>${items.length} listings</b>, each testing a different reading of your vibe${skipped ? ` (${skipped} reading${skipped === 1 ? "" : "s"} had nothing nearby)` : ""}.
+    <span class="hi">${icons.up}</span> like, <span class="hi">${icons.heart}</span> love (up to 3), <span class="hi">${icons.trash}</span> hate. Skip any you feel nothing about. Then say why by picking a reason or writing a note, so Claude learns what you were really reacting to.</p></div>`));
+  const grid = h(`<div class="hgrid"></div>`);
+  body.append(grid);
+  const foot = h(`<div class="hfoot"><span id="hcount"></span><button class="btn primary" id="hgo">Sharpen my hunt</button></div>`);
+  app.firstElementChild.append(foot);
+  const post = (it) => api(`/vibe/${pid}/react`, { body: { id: it.id, reaction: it.reaction, why: it.why, note: it.note } });
+  const loves = () => items.filter((i) => i.reaction === "love").length;
+
+  const paintFoot = () => {
+    const rated = items.filter((i) => i.reaction), missing = rated.filter((i) => !i.why.length && !i.note.trim()).length;
+    $("#hcount", foot).innerHTML = `${rated.length} reacted · <span class="hl">♥ ${loves()}/3</span>${missing ? ` · <b>${missing} need a why</b>` : ""}`;
+    $("#hgo", foot).disabled = !rated.length || missing > 0;
+  };
+  const paintCard = (card, it) => {
+    card.className = "hcard " + (it.reaction || "");
+    card.querySelectorAll(".hbtn").forEach((b) => b.classList.toggle("on", b.dataset.r === it.reaction));
+    const why = $(".hwhy", card);
+    if (!it.reaction) { why.hidden = true; why.innerHTML = ""; return; }
+    why.hidden = false;
+    why.innerHTML = `<div class="hq">${it.reaction === "hate" ? "What puts you off?" : "What do you like about it?"} <span>Pick any, or just write a note.</span></div>
+      <div class="chips left">${[...it.facets.map((f) => f.label), "Not sure"].map((l) =>
+        `<button class="chip ${it.why.includes(l) ? "pick" : ""}" data-l="${esc(l)}">${esc(l)}</button>`).join("")}</div>
+      <input class="hnote" placeholder="In your own words (optional)" value="${esc(it.note)}" maxlength="200">`;
+    why.querySelectorAll(".chip").forEach((c) => (c.onclick = async () => {
+      const l = c.dataset.l;
+      if (l === "Not sure") it.why = it.why.includes(l) ? [] : [l];
+      else { it.why = it.why.filter((x) => x !== "Not sure"); it.why = it.why.includes(l) ? it.why.filter((x) => x !== l) : [...it.why, l]; }
+      paintCard(card, it); paintFoot();
+      try { await post(it); } catch (e) { toast(e.message); }
+    }));
+    $(".hnote", why).oninput = (e) => { it.note = e.target.value; paintFoot(); };  // a note counts as a reason
+    $(".hnote", why).onchange = async (e) => { it.note = e.target.value; try { await post(it); } catch (er) { toast(er.message); } };
+  };
+  items.forEach((it) => {
+    const card = h(`<div class="hcard"><a class="himg" style="background-image:url(${it.photo})" ${it.url ? `href="${esc(it.url)}" target="_blank" rel="noopener"` : ""} aria-label="Open listing"></a>
+      <div class="hmeta"><div class="htitle">${esc(it.title)}</div><div class="hprice">${esc(it.price_text)}</div><span class="chip">${esc(it.reading)}</span></div>
+      <div class="hbtns"><button class="hbtn up" data-r="like" aria-label="Like">${icons.up}</button>
+        <button class="hbtn love" data-r="love" aria-label="Love">${icons.heart}</button>
+        <button class="hbtn down" data-r="hate" aria-label="Hate">${icons.trash}</button></div>
+      <div class="hwhy" hidden></div></div>`);
+    card.querySelectorAll(".hbtn").forEach((b) => (b.onclick = async () => {
+      const r = b.dataset.r, before = { reaction: it.reaction, why: it.why, note: it.note };
+      if (r === "love" && it.reaction !== "love" && loves() >= 3) return toast("You can love up to 3. Take a heart off another one first.");
+      if (it.reaction === r) Object.assign(it, { reaction: null, why: [], note: "" });
+      else Object.assign(it, { reaction: r, why: it.reaction && (it.reaction === "hate") === (r === "hate") ? it.why : [], note: it.note });
+      paintCard(card, it); paintFoot();
+      try { await post(it); } catch (e) { Object.assign(it, before); paintCard(card, it); paintFoot(); toast(e.message); }
+    }));
+    paintCard(card, it);
+    grid.append(card);
+  });
+  paintFoot();
+  $("#hgo", foot).onclick = async (e) => {
+    e.currentTarget.disabled = true;
+    try { foot.remove(); paintVibe(await api(`/vibe/${pid}/refine`, { body: {} })); }
+    catch (err) { toast(err.message); app.firstElementChild.append(foot); paintFoot(); }
+  };
+}
+
+function vibeResult(v, pid) {
+  const body = vibeShell("Your sharpened hunt");
+  const saved = v.status === "applied";
+  const ed = huntEditor(saved ? { hunt: S.state.profile.hunt, criteria: S.state.profile.criteria, min_price: S.state.profile.min_price, max_price: S.state.profile.max_price } : v.result);
+  const rated = v.items.filter((i) => i.reaction).length;
+  if (v.result.learned?.length) body.append(h(`<div class="card-block"><h3>What I learned</h3><ul class="vlearn">${v.result.learned.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`));
+  const card = h(`<div class="card-block"><h3>${saved ? "Saved to your hunt" : "Edit, then save"}</h3></div>`);
+  card.append(ed.el);
+  body.append(card);
+  const acts = h(`<div class="vacts">
+    <button class="big-btn" id="vsave" style="flex:none">${saved ? "Save changes" : "Save to my hunt"}<small>Your next batch uses this</small></button>
+    ${rated ? `<button class="btn" id="vweb" ${v.web_added ? "disabled" : ""}>${v.web_added ? "Ratings are in your web" : `Also add my ${rated} rating${rated === 1 ? "" : "s"} to my web${rated < v.items.length ? ` (of ${v.items.length} listings)` : ""}`}</button>
+      <p class="mode-note">Optional. The hone ratings only shaped this hunt. Adding them also teaches your taste web, as a finished batch.</p>` : ""}
+    ${saved ? `<button class="btn ghost" id="vdone">Back to home</button>` : ""}</div>`);
+  body.append(acts);
+  $("#vsave", acts).onclick = async () => {
+    try { await api(`/vibe/${pid}/apply`, { body: ed.read() }); toast("Saved. Start a batch when you're ready."); go("home"); }
+    catch (err) { toast(err.message); }
+  };
+  $("#vweb", acts) && ($("#vweb", acts).onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const r = await api(`/vibe/${pid}/web`, { body: {} });
+      toast(`Added ${r.added} of ${rated} to your web`);
+      btn.textContent = "Ratings are in your web";
+    } catch (err) { toast(err.message); btn.disabled = false; }
+  });
+  $("#vdone", acts) && ($("#vdone", acts).onclick = () => go("home"));
 }

@@ -41,6 +41,28 @@ CREATE TABLE IF NOT EXISTS batches (
   ready_at REAL,
   finished_at REAL
 );
+CREATE TABLE IF NOT EXISTS vibes (
+  profile_id INTEGER PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'inputs',   -- inputs, analyzing, drafted, fetching, hone, refining, refined, applied
+  progress TEXT NOT NULL DEFAULT '',
+  error TEXT,
+  text TEXT NOT NULL DEFAULT '',
+  sources TEXT NOT NULL DEFAULT '[]',      -- photos, listing links, pins and boards the person gave
+  draft TEXT NOT NULL DEFAULT '{}',        -- the hunt Claude wrote: hunt, criteria, min_price, max_price, summary
+  readings TEXT NOT NULL DEFAULT '[]',     -- every way the vibe could be read, each with a search query
+  items TEXT NOT NULL DEFAULT '[]',        -- the hone grid, with the person's reactions and reasons
+  result TEXT NOT NULL DEFAULT '{}',       -- the hunt after honing, plus what was learned
+  honed INTEGER NOT NULL DEFAULT 0,        -- one hone per hunt
+  web_added INTEGER NOT NULL DEFAULT 0,
+  credits_used INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS places (
+  name TEXT PRIMARY KEY,
+  lat REAL NOT NULL,
+  lng REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS listings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   profile_id INTEGER NOT NULL,
@@ -144,12 +166,75 @@ CREATE TABLE IF NOT EXISTS usage (
   cost REAL NOT NULL,
   at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS predictions (
+  listing_id INTEGER PRIMARY KEY,
+  profile_id INTEGER NOT NULL,
+  batch_id INTEGER NOT NULL,
+  claude_score REAL,                -- Claude's closer-look score, 0-100
+  model_score REAL,                 -- the local trait model, 0-1
+  predicted REAL,                   -- the blended prediction the person was shown, 0-1
+  checklist_nos INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL          -- written once, when the batch is built, before the person sees the listing
+);
+CREATE TABLE IF NOT EXISTS schema_version (
+  key TEXT PRIMARY KEY,
+  version INTEGER NOT NULL,
+  applied_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS planets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  profile_id INTEGER NOT NULL,              -- the system it orbits in
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',     -- what belongs here
+  r REAL NOT NULL,                          -- orbit, in field units (0 = sun, 1 = edge); a moon placed here inherits it
+  theta REAL,                               -- direction; NULL = no particular reason
+  reasons TEXT,                             -- {price,right,guess,wrong} the planet stands for, or NULL
+  legacy_group_id INTEGER UNIQUE,           -- set when this planet was migrated from a Kindling group
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS planet_members (
+  planet_id INTEGER NOT NULL,
+  listing_id INTEGER NOT NULL,
+  PRIMARY KEY (planet_id, listing_id)
+);
+CREATE TABLE IF NOT EXISTS placements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  listing_id INTEGER NOT NULL,
+  profile_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                       -- first (the scored placement) | move | rocket | sun_switch
+  origin TEXT NOT NULL DEFAULT 'placed',    -- placed | migrated | migrated_keeper
+  r REAL NOT NULL,                          -- stored position in field units, exactly where it was released
+  theta REAL,                               -- NULL inside the Sun and for migrated swipes (no known reason)
+  rating REAL NOT NULL,                     -- what taste learns from; equals rating(r) except for migrated Sun listings
+  reasons TEXT,                             -- {price,right,guess,wrong}; NULL when unknown
+  reason_known INTEGER NOT NULL DEFAULT 1,
+  weight REAL NOT NULL DEFAULT 1.0,         -- learning weight (rocketed listings count less)
+  planet_id INTEGER,
+  sun INTEGER NOT NULL DEFAULT 0,           -- which sun, for a binary star
+  undone INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_placements_listing ON placements(listing_id, id);
+CREATE INDEX IF NOT EXISTS idx_placements_profile ON placements(profile_id, kind);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  profile_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                       -- black_hole | new_star | dwarf_planet | asteroid_shower | outlier
+  status TEXT NOT NULL DEFAULT 'queued',    -- queued | shown | confirmed | rejected
+  title TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  evidence TEXT NOT NULL DEFAULT '{}',      -- the measured numbers that triggered it
+  created_at REAL NOT NULL,
+  shown_at REAL,
+  resolved_at REAL,
+  muted_until REAL                          -- a rejected event is not repeated before this
+);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, at);
 CREATE INDEX IF NOT EXISTS idx_listings_batch ON listings(batch_id);
 CREATE INDEX IF NOT EXISTS idx_listings_profile ON listings(profile_id);
 """
 
-JSON_COLS = {"criteria", "queries", "modifiers", "stats", "weights", "concepts", "query_stats", "landmarks", "fb_attributes", "photos", "tags", "features", "checklist"}
+JSON_COLS = {"criteria", "queries", "modifiers", "stats", "weights", "concepts", "query_stats", "landmarks", "fb_attributes", "photos", "tags", "features", "checklist", "sources", "draft", "readings", "items", "result", "rejected", "must_have", "reasons", "evidence", "suns"}
 
 
 def _connect():
@@ -217,12 +302,31 @@ MIGRATIONS = [
     ("batches", "stats", "TEXT"),                              # frozen recap numbers once listings are forgotten
     ("listings", "state", "TEXT NOT NULL DEFAULT 'web'"),      # 'web' = a node in the web, 'out' = keeper only
     ("listings", "keeper", "INTEGER NOT NULL DEFAULT 0"),
+    ("listings", "avail", "TEXT"),                             # keeper check: 'live' | 'gone' | NULL (never checked / couldn't tell)
+    ("listings", "avail_at", "REAL"),                          # when the keeper was last checked
+    ("listings", "price_prev", "REAL"),                        # price before the last check changed it
     ("listings", "absorbed", "INTEGER NOT NULL DEFAULT 0"),    # its taste already lives in a crystal
     ("profiles", "user_id", "INTEGER"),                        # whose hunt this is
     ("seen", "phash", "TEXT"),                                 # photo fingerprint, to spot reposts
     ("seen", "tkey", "TEXT"),
     ("seen", "price", "REAL"),
     ("seen", "loc", "TEXT"),
+    ("profiles", "must_have", "TEXT NOT NULL DEFAULT '[]'"),  # checklist items that remove a listing when the answer is no
+    ("seen", "state", "TEXT NOT NULL DEFAULT 'shown'"),        # 'shown' = put in a batch; 'rejected' = judged not a fit, skipped for a while
+    ("seen", "at", "REAL"),
+    ("profiles", "state", "TEXT NOT NULL DEFAULT 'active'"),   # active | finished ("found it")
+    ("profiles", "found_at", "REAL"),
+    ("events", "resolution", "TEXT"),                          # what the person chose, e.g. "binary" or "forget"
+    ("profiles", "binary", "INTEGER NOT NULL DEFAULT 0"),      # a second sun inside this system
+    ("profiles", "suns", "TEXT NOT NULL DEFAULT '[]'"),         # [{name, tags}] one entry per sun when binary
+    ("predictions", "sun_guess", "INTEGER"),                   # which sun Claude started this listing on (binary stars)
+    ("predictions", "sun_actual", "INTEGER"),
+    ("swipes", "weight", "REAL NOT NULL DEFAULT 1.0"),       # learning weight; rocketed listings count less
+    ("predictions", "guess_text", "TEXT"),                     # Claude's guess of what the person will dislike (the down label)
+    ("predictions", "checked_at", "REAL"),                     # set once, when the first placement is made
+    ("predictions", "actual_rating", "REAL"),
+    ("predictions", "gap", "REAL"),                            # |predicted - actual|, the raw material for Confidence
+    ("vibes", "rejected", "TEXT NOT NULL DEFAULT '[]'"),      # readings of a vibe the person said were wrong
 ]
 
 
@@ -236,7 +340,7 @@ def init():
     # The first account is the admin, and owns everything made before accounts existed
     admin = q1("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
     if not admin:
-        aid = ex("INSERT INTO users (name, role, claude_cap, created_at) VALUES (?,?,?,?)", ("Admin", "admin", None, now()))
+        aid = ex("INSERT INTO users (name, role, claude_cap, created_at) VALUES (?,?,?,?)", ("Matt", "admin", None, now()))
     else:
         aid = admin["id"]
     ex("UPDATE profiles SET user_id=? WHERE user_id IS NULL", (aid,))
@@ -254,6 +358,10 @@ def recover_interrupted():
         "UPDATE batches SET status='error', error='Interrupted by a server restart' "
         "WHERE status IN ('queued','searching','screening','scoring')"
     )
+    # vibe setup steps that were running go back to the step before them
+    ex("UPDATE vibes SET status='inputs', progress='', error='Interrupted by a server restart. Try again.' WHERE status='analyzing'")
+    ex("UPDATE vibes SET status='drafted', progress='', error='Interrupted by a server restart. Try again.' WHERE status='fetching'")
+    ex("UPDATE vibes SET status='hone', progress='', error='Interrupted by a server restart. Try again.' WHERE status='refining'")
 
 
 def new_profile(user_id, name, hunt=""):

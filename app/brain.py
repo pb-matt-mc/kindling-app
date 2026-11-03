@@ -38,9 +38,17 @@ def _extract_json(text):
             obj, _ = dec.raw_decode(text, m.start())
         except ValueError:
             continue
-        if isinstance(obj, dict) or (isinstance(obj, list) and obj):
+        if isinstance(obj, dict):
             return obj
     raise BrainError("no complete JSON object in reply")
+
+
+def _num(v, default, lo=0.0, hi=100.0):
+    """A model-supplied number clamped to [lo, hi]; falls back to default for '85%', null, etc."""
+    try:
+        return max(lo, min(hi, float(str(v).strip().rstrip("%"))))
+    except (TypeError, ValueError):
+        return default
 
 
 async def _call(model, content, max_tokens=1500, label="claude"):
@@ -116,6 +124,13 @@ def _context_text(profile, ctx):
     if ctx.get("batch_modifiers"):
         lines.append("EXTRA FOR THIS BATCH ONLY (weigh these heavily in search terms and appeal; they don't "
                      "change what counts as the right kind of item): " + "; ".join(ctx["batch_modifiers"]))
+    if ctx.get("vibe"):
+        v = ctx["vibe"]
+        lines.append("THIS IS A VIBE HUNT, NOT A SINGLE-ITEM HUNT. The description above is a feeling to fill, and "
+                     "any item that serves it counts as a fit, across many item types. Item types that can serve "
+                     "it: " + "; ".join(v["readings"][:25]) + "."
+                     + (" Types they responded well to (examples of the family, not the only answer): "
+                        + "; ".join(v["loved"][:8]) + "." if v.get("loved") else ""))
     if profile.get("taste_summary"):
         lines.append("TASTE SO FAR (from their swipes): " + profile["taste_summary"])
     if ctx.get("weights"):
@@ -166,6 +181,12 @@ async def plan_queries(profile, ctx, n=3, weirdness=0.25):
     prompt = (
         f"{_context_text(profile, ctx)}\n\nPAST SEARCH QUERIES AND HIT RATES:\n{hist_txt}\n\n"
         f"{_weird_brief(weirdness)}\n\n"
+        + (("VIBE HUNT RULES: every query must be a DIFFERENT item type that serves the vibe (use the item types "
+            "listed above, or others that fit). Never two queries of the same type. Don't reuse a type from "
+            "recent batches unless nothing else is left"
+            + (": recent batches searched " + "; ".join(ctx["vibe"]["recent_queries"]) if ctx["vibe"].get("recent_queries") else "")
+            + ". Lean toward types they liked but spend at least half the queries on types not tried yet. "
+            "Hit rates above describe past queries, not a reason to repeat them.\n\n") if ctx.get("vibe") else "") +
         f"Write {n} Facebook Marketplace search queries for the next batch. Marketplace search is plain "
         "keyword matching on titles, so use short phrases sellers would actually type (2-4 words). "
         "Price range and location are handled separately, so leave them out of the queries. "
@@ -174,7 +195,7 @@ async def plan_queries(profile, ctx, n=3, weirdness=0.25):
     )
     try:
         out = await _call(config.MODEL_SCREEN, [{"type": "text", "text": prompt}], 1200, label="plan queries")
-        qs = [q.strip() for q in out.get("queries", []) if isinstance(q, str) and q.strip()]
+        qs = [q.strip() for q in (out.get("queries") or []) if isinstance(q, str) and q.strip()]
     except BrainError as e:
         log.warning("plan queries: falling back to keyword queries (%s)", e)
         qs = []
@@ -231,11 +252,10 @@ async def screen(profile, ctx, candidates):
         content.append({"type": "text", "text": 'Reply as {"scores": {"<id>": {"fit": <0-100>, "appeal": <0-100>}, ...}}'})
         try:
             out = await _call(config.MODEL_SCREEN, content, 3000, label="thumbnail screen")
-            for k, v in (out.get("scores") or {}).items():
-                try:
-                    out_all[str(k)] = {"fit": float(v.get("fit", 0)), "appeal": float(v.get("appeal", 0))}
-                except (AttributeError, TypeError, ValueError):
-                    pass
+            scores = out.get("scores")
+            for k, v in (scores.items() if isinstance(scores, dict) else []):
+                if isinstance(v, dict):
+                    out_all[str(k)] = {"fit": _num(v.get("fit"), 0.0), "appeal": _num(v.get("appeal"), 0.0)}
         except BrainError as e:
             log.warning("thumbnail screen: using keyword fallback for %d listings (%s)", len(chunk), e)
         for c in chunk:
@@ -270,6 +290,8 @@ async def deep_score(profile, ctx, listing, images):
         + (f" ({len(criteria)} items, same order)" if criteria else
            " (no checklist set, so give 3-4 items you infer from the hunt, e.g. color, size, style)")
         + ', each {"item": short label, "status": "yes"|"no"|"unsure", "note": "<= 8 words"}\n'
+        '- "guess": at most 6 words naming the one thing this person is most likely to dislike about this listing, '
+        'e.g. "Legs look wobbly" or "Too big for the room". Specific to this listing, no hedging.\n'
         '- "take": one or two casual sentences on why they would or wouldn\'t like it, naming what can\'t be told from the photos\n'
         '- "tags": 4-10 lowercase "key:value" tags with keys from ' + ", ".join(TAG_KEYS[:5]) +
         ' (e.g. "color:sage", "style:mid-century", "material:velvet", "shape:sofa", "feature:track arms")\n'
@@ -284,21 +306,19 @@ async def deep_score(profile, ctx, listing, images):
         if blk:
             content.append(blk)
     out = await _call(config.MODEL_SCORE, content, 2000, label=f"closer look '{listing['title'][:40]}'")
-    tags = sorted({t.strip().lower() for t in out.get("tags", []) if isinstance(t, str) and ":" in t})
-    checklist = [c for c in out.get("checklist", []) if isinstance(c, dict)]
+    tags = sorted({t.strip().lower() for t in (out.get("tags") or []) if isinstance(t, str) and ":" in t})
+    checklist = [c for c in (out.get("checklist") or []) if isinstance(c, dict)]
     for c in checklist:
         c["status"] = c.get("status") if c.get("status") in ("yes", "no", "unsure") else "unsure"
-    try:
-        fit = max(0.0, min(100.0, float(out.get("fit", 100))))
-    except (TypeError, ValueError):
-        fit = 100.0
+    fit = _num(out.get("fit"), 100.0)
     breaks = [b for b in (out.get("breaks") or []) if isinstance(b, str) and b.strip()]
     return {
         "fit": fit,
         "breaks": breaks,
-        "score": max(0.0, min(100.0, float(out.get("score", 50)))),
+        "score": _num(out.get("score"), 50.0),
         "checklist": checklist,
         "take": str(out.get("take") or "").strip(),
+        "guess": " ".join(str(out.get("guess") or "").split())[:60],
         "tags": tags,
         "features": out.get("features") if isinstance(out.get("features"), dict) else {},
     }
@@ -406,6 +426,209 @@ def _mock_deep(profile, ctx, listing):
         tags.append("size:" + ("under 72in" if width < 72 else "72-84in" if width <= 84 else "over 84in"))
     low_all = text.lower()
     breaks = [w for w in (ctx.get("batch_nots") or []) if re.search(r"\b" + re.escape(w.lower()) + r"\b", low_all)]
-    return {"fit": _mock_screen(profile, ctx, listing["title"])["fit"], "breaks": breaks,
+    no = next((c["item"] for c in checklist if c["status"] == "no"), None)
+    price = listing.get("price")
+    guess = (f"{no} may not fit" if no else "Price feels high" if price and price > 400
+             else f"{bad[0].title()} may not click" if bad else "Hard to judge from photos")
+    return {"fit": _mock_screen(profile, ctx, listing["title"])["fit"], "breaks": breaks, "guess": guess,
             "score": score, "checklist": checklist, "take": take.strip(), "tags": sorted(set(tags)),
             "features": {"width_in": width, "condition_grade": 3}}
+
+
+# --------------------------------------------------------------------------- vibes
+# A vibe is a feeling with no particular object ("a pop of color", "wall-mounted decor"). Claude reads the
+# person's references, lists every concrete thing the vibe could mean, and drafts the hunt.
+
+HONE_MIN, HONE_MAX = 10, 25  # listings in the hone grid: at least 10, never more than 25
+
+
+def hone_size(n_readings):
+    """One listing per reading is the least that tests each of them; pad up to 10, never past 25."""
+    return max(HONE_MIN, min(HONE_MAX, n_readings))
+
+
+async def vibe_analyze(profile, text, notes, images, rejected=()):
+    """text: what they typed. notes: text from links ("Pinterest board: ..."). images: [(bytes, ext)].
+    Returns {"summary", "hunt", "criteria", "min_price", "max_price", "readings": [{"label","query","note"}]}."""
+    if config.brain_mode() == "mock":
+        return _mock_vibe(profile, text, notes)
+    prompt = (
+        f"The person is starting a new hunt called \"{profile['name']}\". They don't want one particular item: "
+        "they want to chase a VIBE, and they gave you references.\n\n"
+        f"WHAT THEY WROTE: {text.strip() or '(nothing, only references)'}\n"
+        + (("WHAT THEIR LINKS SAID:\n- " + "\n- ".join(notes) + "\n") if notes else "")
+        + (("THEY ALREADY RULED OUT THESE READINGS as wrong for this vibe, so don't offer them or close variants, "
+            "and let it steer your hunt away from them:\n- " + "\n- ".join(rejected) + "\n") if rejected else "")
+        + f"{len(images)} image(s) follow (their photos, listing photos and pins).\n\n"
+        "Do three things.\n"
+        "1. READINGS: list EVERY distinct, concrete, shoppable thing this vibe could mean on Facebook Marketplace "
+        "(for \"a pop of color\": a throw pillow, a bold rug, an art print, a ceramic vase, a colorful lamp, a "
+        "painted side table...). Cover different item types, scales and price points, and the unexpected readings "
+        "too, not just the obvious ones. Each reading has a short label, a 2-4 word search query sellers would "
+        "actually type, and one line on how it serves the vibe. If you find more than 25, merge the closest "
+        "ones until there are 25 or fewer. Don't pad a short list.\n"
+        "2. HUNT: write the hunt the way they'd tell a friend, 2-3 sentences, in their voice and without inventing "
+        "details they didn't give. Say what the vibe is for and what it should feel like.\n"
+        "3. CHECKLIST: at most 4 short things a good find should satisfy (color, scale, mood...), only ones the "
+        "references actually support and that hold across the different readings. Fewer is better: every item "
+        "narrows the search. Add min_price/max_price only if they stated or clearly implied a budget, else null.\n"
+        'Reply as {"summary": "one line", "hunt": "...", "criteria": ["..."], "min_price": null, '
+        '"max_price": null, "readings": [{"label": "...", "query": "...", "note": "..."}]}'
+    )
+    content = [{"type": "text", "text": prompt}]
+    for i, (data, ext) in enumerate(images[:16]):
+        blk = _img_block(data, ext)
+        if blk:
+            content.append({"type": "text", "text": f"Image {i + 1}:"})
+            content.append(blk)
+    out = await _call(config.MODEL_SCORE, content, 4000, label="vibe: read the references")
+    return _clean_vibe(out, profile, text)
+
+
+def _clean_vibe(out, profile, text=""):
+    readings, seen = [], set()
+    for r in out.get("readings") or []:
+        if not isinstance(r, dict):
+            continue
+        label = str(r.get("label") or "").strip()[:60]
+        query = " ".join(str(r.get("query") or label).split())[:60]
+        if label and query.lower() not in seen:
+            seen.add(query.lower())
+            readings.append({"label": label, "query": query, "note": str(r.get("note") or "").strip()[:160]})
+    price = lambda v: (float(v) if isinstance(v, (int, float)) and v >= 0 else None)
+    return {
+        "summary": str(out.get("summary") or "").strip()[:200],
+        "hunt": str(out.get("hunt") or text or profile.get("hunt") or "").strip()[:900],
+        "criteria": [str(c).strip()[:80] for c in (out.get("criteria") or []) if str(c).strip()][:5],
+        "min_price": price(out.get("min_price")), "max_price": price(out.get("max_price")),
+        "readings": readings[:HONE_MAX],
+    }
+
+
+def _mock_vibe(profile, text, notes):
+    parts = [p.strip() for p in re.split(r",|;|\band\b|\bor\b|\n", text or "") if len(p.strip()) > 2]
+    base = parts or ["throw pillow", "wall art", "vase", "rug", "lamp", "mirror", "blanket", "basket", "side table",
+                     "planter"]
+    readings = [{"label": p[:40], "query": " ".join(p.split()[:3]), "note": "Mock mode keyword reading"} for p in base[:12]]
+    return {"summary": "Mock mode: no Claude key, so these are keyword guesses.", "hunt": (text or "").strip(),
+            "criteria": [], "min_price": None, "max_price": None, "readings": readings}
+
+
+async def vibe_pick(draft, readings, candidates):
+    """candidates: [{key, reading, title, price_text, image}]. For each: how well it shows its reading, tags,
+    and the facets someone might be reacting to. Returns {key: {"fit", "tags", "facets"}}."""
+    if config.brain_mode() == "mock" or not candidates:
+        return {c["key"]: _mock_pick(c) for c in candidates}
+    out_all = {}
+    for i in range(0, len(candidates), 12):
+        chunk = candidates[i:i + 12]
+        content = [{"type": "text", "text":
+                    f"VIBE THEY ARE CHASING: {draft.get('hunt') or '(see readings)'}\n\n"
+                    "Each candidate listing below was searched for one reading of that vibe. For each one:\n"
+                    "- fit: 0-100, how clearly it is a real, good example of its reading (not junk, not an accessory "
+                    "or part, not a different item that matched a keyword)\n"
+                    "- tags: 4-8 lowercase \"key:value\" tags, keys from color, style, material, shape, feature\n"
+                    "- facets: 4-6 things they could be reacting to when they like or dislike it, in plain words, "
+                    "each {\"label\": short phrase, \"scope\": \"piece\"|\"type\"|\"attribute\"|\"price\"}. Always "
+                    "include: this exact piece (\"this exact one\"), its type in general (\"any rug like this\"), "
+                    "its main color, and one more attribute such as material, pattern, scale or style. Add price "
+                    "only if the price looks like a big part of the story. Labels must make sense after \"I like...\" "
+                    "and after \"I dislike...\".\n"
+                    "Thumbnails follow, each labelled with its id."}]
+        for c in chunk:
+            content.append({"type": "text", "text": f"id={c['key']} | reading: {c['reading']} | {c['title']} | {c.get('price_text') or ''}"})
+            blk = _img_block(*c["image"]) if c.get("image") else None
+            if blk:
+                content.append(blk)
+        content.append({"type": "text", "text": 'Reply as {"items": {"<id>": {"fit": 0-100, "tags": ["..."], '
+                        '"facets": [{"label": "...", "scope": "..."}]}}}'})
+        try:
+            out = await _call(config.MODEL_SCREEN, content, 5000, label="vibe: look at hone candidates")
+            for k, v in (out.get("items") or {}).items():
+                if isinstance(v, dict):
+                    out_all[str(k)] = {
+                        "fit": _num(v.get("fit"), 0.0),
+                        "tags": sorted({t.strip().lower() for t in (v.get("tags") or []) if isinstance(t, str) and ":" in t}),
+                        "facets": _clean_facets(v.get("facets")),
+                    }
+        except BrainError as e:
+            log.warning("vibe pick: using plain facets for %d listings (%s)", len(chunk), e)
+        for c in chunk:
+            out_all.setdefault(c["key"], _mock_pick(c))
+    return out_all
+
+
+def _clean_facets(raw):
+    out = []
+    for f in raw or []:
+        if isinstance(f, dict) and str(f.get("label") or "").strip():
+            scope = f.get("scope") if f.get("scope") in ("piece", "type", "attribute", "price") else "attribute"
+            out.append({"label": str(f["label"]).strip()[:60], "scope": scope})
+    return out[:7]
+
+
+def _mock_pick(c):
+    kind = c["reading"].lower()
+    return {"fit": 60.0, "tags": mock_tags(c["title"]),
+            "facets": [{"label": "this exact one", "scope": "piece"}, {"label": f"any {kind} like this", "scope": "type"},
+                       {"label": "the color", "scope": "attribute"}, {"label": "the style", "scope": "attribute"},
+                       {"label": "the price", "scope": "price"}]}
+
+
+async def vibe_refine(profile, draft, items, rejected=()):
+    """items: reacted hone items. Returns the sharpened hunt plus what was learned."""
+    reacted = [i for i in items if i.get("reaction")]
+    if config.brain_mode() == "mock":
+        return _mock_refine(draft, reacted)
+    lines = []
+    for i in reacted:
+        why = "; ".join(i.get("why") or []) or "(no reason given)"
+        note = f" Their words: {i['note']}" if i.get("note") else ""
+        lines.append(f"- [{i['reaction'].upper()}] reading \"{i['reading']}\": {i['title']} {i.get('price_text') or ''}. "
+                     f"Because: {why}.{note}")
+    prompt = (
+        f"HUNT DRAFT (written from their references):\n{draft.get('hunt')}\nCHECKLIST: {'; '.join(draft.get('criteria') or [])}\n"
+        f"BUDGET: {draft.get('min_price') or '-'} to {draft.get('max_price') or '-'}\n\n"
+        + (("They had already ruled out these readings of the vibe, so don't steer back toward them: "
+            + "; ".join(rejected) + ".\n\n") if rejected else "") +
+        "They then reacted to real listings, each testing a different reading of the vibe. LOVE means a strong "
+        "yes (they can pick at most 3), LIKE a plain yes, HATE a no; listings not listed here were skipped. "
+        "The \"Because\" part is what they said they were reacting to: \"this exact one\" means only that piece, "
+        "\"any X\" means the whole type, and so on. Weigh a reason by its scope.\n"
+        + "\n".join(lines) + "\n\n"
+        "Rewrite the hunt so it points at what they actually want, but KEEP IT A VIBE HUNT, not an item hunt. Hard "
+        "rules for the rewrite:\n"
+        "- Do not narrow to one item type, even if they loved one. A loved type is an EXAMPLE of the family they "
+        "like: name the 2-4 types that worked as examples (\"things like a plank bench, a storage bench or a low "
+        "shelf\") and keep the door open to others that do the same job.\n"
+        "- Describe the feeling, the job in the room and the look (color, material, mood). Don't give exact sizes or "
+        "counts unless they stated them; never say 'best starting point' or rank item types.\n"
+        "- Turn hates into a short avoid-line of specific things, not whole categories unless they hated the whole "
+        "category on every example.\n"
+        "- At most 4 checklist items, each short and soft (a lean, not a rule). Fewer is better: every item "
+        "narrows the search and the search is already thin.\n"
+        "Keep their voice. Don't invent anything they didn't show. Give a budget only if their reactions or the "
+        "draft support one (else keep the draft's), and 3-6 short \"learned\" sentences about their taste.\n"
+        'Reply as {"hunt": "...", "criteria": ["..."], "min_price": null, "max_price": null, "learned": ["..."]}'
+    )
+    out = await _call(config.MODEL_SCORE, [{"type": "text", "text": prompt}], 2500, label="vibe: refine the hunt")
+    price = lambda v, d: (float(v) if isinstance(v, (int, float)) and v >= 0 else d)
+    return {
+        "hunt": str(out.get("hunt") or draft.get("hunt") or "").strip()[:1200],
+        "criteria": [str(c).strip()[:80] for c in (out.get("criteria") or []) if str(c).strip()][:5] or draft.get("criteria") or [],
+        "min_price": price(out.get("min_price"), draft.get("min_price")),
+        "max_price": price(out.get("max_price"), draft.get("max_price")),
+        "learned": [str(x).strip()[:200] for x in (out.get("learned") or []) if str(x).strip()][:8],
+    }
+
+
+def _mock_refine(draft, reacted):
+    loved = [i["reading"] for i in reacted if i["reaction"] in ("love", "like")]
+    hated = [i["reading"] for i in reacted if i["reaction"] == "hate"]
+    hunt = (draft.get("hunt") or "").strip()
+    if loved:
+        hunt += f" Chase: {', '.join(dict.fromkeys(loved))}."
+    if hated:
+        hunt += f" Skip: {', '.join(dict.fromkeys(hated))}."
+    return {"hunt": hunt.strip(), "criteria": draft.get("criteria") or [], "min_price": draft.get("min_price"),
+            "max_price": draft.get("max_price"), "learned": ["Mock mode: no Claude key, so nothing was really learned."]}

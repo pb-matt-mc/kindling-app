@@ -70,6 +70,9 @@ export function createWeb(container, opts) {
   zoomUI.append("button").text("−").on("click", () => svg.transition().duration(250).call(zoom.scaleBy, 0.62));
   zoomUI.append("button").html("&#8962;").attr("title", "Reset").on("click", () =>
     svg.transition().duration(300).call(zoom.transform, home()));
+  const detangleBtn = zoomUI.append("button").attr("title", "Untangle").attr("aria-label", "Untangle")
+    .html('<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7c6 0 10 10 16 10M4 17c6 0 10-10 16-10"/></svg>')
+    .on("click", () => detangle());
   if (onExport) {
     zoomUI.append("button").attr("title", "Export").attr("aria-label", "Export")
       .html('<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>')
@@ -315,6 +318,110 @@ export function createWeb(container, opts) {
       reseat();
       await onRank?.(d.id, d.rank);
     });
+
+
+  // Ranks fix how far each node sits from the middle, so untangling only has to choose angles.
+  // Anneal them to cut the number of crossing links (plus a little total link length, so neighbours
+  // end up close), keeping nodes from landing on top of each other, then glide there.
+  let untangling = false;
+  async function detangle() {
+    if (untangling || nodes.length < 3 || !links.length) return;
+    untangling = true;
+    detangleBtn.attr("disabled", true);
+    await new Promise((r) => setTimeout(r, 30));  // let the pressed state paint before we hog the thread
+    const n = nodes.length, idx = new Map(nodes.map((d, i) => [d.id, i]));
+    const ea = [], eb = [];
+    for (const l of links) {
+      const a = idx.get(typeof l.source === "object" ? l.source.id : l.source);
+      const b = idx.get(typeof l.target === "object" ? l.target.id : l.target);
+      if (a != null && b != null && a !== b) { ea.push(a); eb.push(b); }
+    }
+    const m = ea.length, inc = nodes.map(() => []);
+    for (let e = 0; e < m; e++) { inc[ea[e]].push(e); inc[eb[e]].push(e); }
+    const rad = nodes.map((d) => Math.max(1, Math.hypot(d.x, d.y)));
+    const ang = nodes.map((d) => Math.atan2(d.y, d.x));
+    const px = (i) => rad[i] * Math.cos(ang[i]), py = (i) => rad[i] * Math.sin(ang[i]);
+    const X = nodes.map((_, i) => px(i)), Y = nodes.map((_, i) => py(i));
+    const orient = (ax, ay, bx, by, cx, cy) => (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    const cross = (e, f) => {
+      const a = ea[e], b = eb[e], c = ea[f], d = eb[f];
+      if (a === c || a === d || b === c || b === d) return 0;
+      const o1 = orient(X[a], Y[a], X[b], Y[b], X[c], Y[c]), o2 = orient(X[a], Y[a], X[b], Y[b], X[d], Y[d]);
+      if (o1 * o2 >= 0) return 0;
+      const o3 = orient(X[c], Y[c], X[d], Y[d], X[a], Y[a]), o4 = orient(X[c], Y[c], X[d], Y[d], X[b], Y[b]);
+      return o3 * o4 < 0 ? 1 : 0;
+    };
+    const lam = 0.5 / R;
+    const costOf = (ids) => {  // crossings and length of every link touching these nodes
+      const seen = new Set();
+      let c = 0;
+      for (const i of ids) for (const e of inc[i]) {
+        if (seen.has(e)) continue;
+        seen.add(e);
+        for (let f = 0; f < m; f++) if (f !== e) c += cross(e, f);
+        c += lam * Math.hypot(X[ea[e]] - X[eb[e]], Y[ea[e]] - Y[eb[e]]);
+      }
+      return c;
+    };
+    const total = () => { let c = 0; for (let e = 0; e < m; e++) for (let f = e + 1; f < m; f++) c += cross(e, f); return c; };
+    const gap = NODE * 2 + 3;
+    const free = (i, skip) => {
+      for (let j = 0; j < n; j++) if (j !== i && j !== skip && Math.hypot(X[i] - X[j], Y[i] - Y[j]) < gap) return false;
+      return true;
+    };
+    const set = (i, a) => { ang[i] = a; X[i] = px(i); Y[i] = py(i); };
+    const before = total();
+    const movable = nodes.map((_, i) => i).filter((i) => inc[i].length);
+    const budget = Math.min(1400, 250 + n * m * 0.02);
+    const t0 = performance.now();
+    let iter = 0, best = before;
+    const startAng = ang.slice();
+    for (;;) {
+      if ((iter++ & 63) === 0 && performance.now() - t0 > budget) break;
+      const heat = Math.max(0.02, 1.5 * (1 - (performance.now() - t0) / budget));
+      const i = movable[(Math.random() * movable.length) | 0];
+      if (Math.random() < 0.35) {  // swap angles with another node
+        const j = (Math.random() * n) | 0;
+        if (j === i) continue;
+        const ai = ang[i], aj = ang[j], c0 = costOf([i, j]);
+        set(i, aj); set(j, ai);
+        if (free(i) && free(j)) {
+          const d = costOf([i, j]) - c0;
+          if (d <= 0 || Math.random() < Math.exp(-d / heat)) continue;
+        }
+        set(i, ai); set(j, aj);
+      } else {  // slide to a new angle: anywhere, or beside a linked node
+        const ai = ang[i], c0 = costOf([i]);
+        const e = inc[i][(Math.random() * inc[i].length) | 0], o = ea[e] === i ? eb[e] : ea[e];
+        set(i, Math.random() < 0.5 ? Math.random() * Math.PI * 2 : ang[o] + (Math.random() - 0.5) * 0.8);
+        if (free(i)) {
+          const d = costOf([i]) - c0;
+          if (d <= 0 || Math.random() < Math.exp(-d / heat)) continue;
+        }
+        set(i, ai);
+      }
+    }
+    const last = total();
+    const bestAng = last <= before ? ang : startAng;
+    best = Math.min(last, before);
+    nodes.forEach((d, i) => { d._fx = rad[i] * Math.cos(bestAng[i]); d._fy = rad[i] * Math.sin(bestAng[i]); d._x0 = d.x; d._y0 = d.y; });
+    nodes.forEach((d) => { d.fx = d.x; d.fy = d.y; });
+    await new Promise((resolve) => {
+      const t1 = performance.now();
+      const step = () => {
+        const u = d3.easeCubicInOut(Math.min(1, (performance.now() - t1) / 700));
+        for (const d of nodes) { d.fx = d.x = d._x0 + (d._fx - d._x0) * u; d.fy = d.y = d._y0 + (d._fy - d._y0) * u; }
+        tick();
+        if (u < 1) requestAnimationFrame(step); else resolve();
+      };
+      step();
+    });
+    for (const d of nodes) { d.fx = d.fy = null; }
+    sim.alpha(0.12).restart();
+    untangling = false;
+    detangleBtn.attr("disabled", null);
+    onLinkTap?.(best < before ? `Untangled: ${before} crossings down to ${best}` : before ? "Already about as untangled as it gets" : "Nothing was crossing");
+  }
 
   function placeLandmarks() {
     if (!landmarkSel) return;

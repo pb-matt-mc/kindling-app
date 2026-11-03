@@ -1,0 +1,26 @@
+# Template: replace the @PLACEHOLDERS@ and <USER>/<BIND_ADDRESS> before installing.
+# Runs politely on a shared machine: low priority, low CPU weight, a memory ceiling. Bind to a private address, never 0.0.0.0.
+[Unit]
+Description=@NAME@ (Orbit: place secondhand finds around a sun)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<USER>
+WorkingDirectory=@DIR@
+Environment=ORBIT_DATA_DIR=@DATA@
+Environment=ORBIT_SOURCE=@SOURCE@
+ExecStart=@DIR@/.venv/bin/uvicorn app.main:app --host <BIND_ADDRESS> --port @PORT@
+Restart=on-failure
+RestartSec=5
+Nice=10
+CPUWeight=20
+IOWeight=20
+MemoryMax=700M
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

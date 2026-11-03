@@ -1,15 +1,20 @@
 """Builds a batch: plan queries -> search -> screen thumbnails -> pick -> fetch details -> deep score."""
 import asyncio
+import itertools
 import hashlib
 import json
 import random
 
 from .log import log
 
-from . import brain, config, costs, db, dupes, learn, obsidian, rules
+from . import brain, checklist, config, costs, db, dupes, learn, obsidian, recheck, rules
 from .sources import SourceError, get_source
 
 _running = {}
+
+LOOK_FACTOR = 1.5      # the closer look covers this many times the batch size, so it can choose who is shown
+REJECT_DAYS = 30       # a listing judged "not a fit" is skipped this long; one merely not picked is never skipped
+MAX_SCREEN = 45        # thumbnails screened per batch
 
 
 def price_tag(price):
@@ -83,6 +88,15 @@ async def build(batch_id):
              batch["number"], profile["id"], batch["size"], batch.get("weirdness"), batch.get("modifiers"), src.name)
     try:
         ctx = learn.context(profile)
+        vb = db.q1("SELECT * FROM vibes WHERE profile_id=? AND status='applied'", (profile["id"],))
+        if vb and vb["readings"]:  # a vibe hunt: many item types can serve it, so search and judge that way
+            recent = [q for r in db.q("SELECT queries FROM batches WHERE profile_id=? AND id!=? AND progress!='Vibe hone' "
+                                      "ORDER BY id DESC LIMIT 3", (profile["id"], batch_id)) for q in r["queries"]]
+            ctx["vibe"] = {"readings": [r["label"] for r in vb["readings"]],
+                           "loved": list(dict.fromkeys(i["reading"] for i in vb["items"]
+                                                       if i.get("reaction") in ("love", "like"))),
+                           "recent_queries": list(dict.fromkeys(recent))[:9]}
+        vibe_hunt = "vibe" in ctx
         rl = rules.parse(batch.get("modifiers") or [])
         ctx["batch_modifiers"] = rl["soft"]
         ctx["batch_rules"] = rules.describe(rl)
@@ -91,21 +105,32 @@ async def build(batch_id):
         if lo is not None and hi is not None and lo >= hi:
             raise SourceError(f"The price rules can't both be true (over ${lo:,.0f} and under ${hi:,.0f}).")
         search_profile = {**profile, "min_price": lo, "max_price": hi}
-        dropped = {"price": 0, "mentions": 0, "is": 0}
+        dropped = {"price": 0, "mentions": 0, "is": 0, "must": 0}
         size = batch["size"]
         weird = (batch["weirdness"] if batch.get("weirdness") is not None else 25) / 100
         rng = random.Random(batch_id)
 
+        # 0. the Sun and Inner orbit: sold listings fade (they are kept, with what they taught)
+        step = "re-checking your Sun"
+        try:
+            _set(batch_id, status="searching", progress="Re-checking your Sun and Inner listings")
+            credits += (await recheck.run(profile["id"], src))["credits"]
+        except SourceError as e:
+            log.warning("batch %s: re-check skipped (%s)", batch_id, e)
+
         # 1. queries
         step = "picking search terms"
         _set(batch_id, status="searching", progress="Picking search terms")
-        n_q = 2 if src.name == "apify" else 3
+        n_q = (3 if vibe_hunt else 2) if src.name == "apify" else (5 if vibe_hunt else 3)
         queries = await brain.plan_queries(profile, ctx, n_q, weird)
         _set(batch_id, queries=queries, progress=f"Searching: {', '.join(queries)}")
 
         # 2. search
         step = "searching Marketplace"
-        seen = {r["fb_id"] for r in db.q("SELECT fb_id FROM seen WHERE profile_id=?", (profile["id"],))}
+        # skip what the person was shown, and what was recently judged not a fit. Listings that merely weren't
+        # picked are never held back: they were never seen, so they stay eligible.
+        seen = {r["fb_id"] for r in db.q("SELECT fb_id FROM seen WHERE profile_id=? AND (state='shown' OR at>?)",
+                                         (profile["id"], db.now() - REJECT_DAYS * 86400))}
         pool, order = {}, []
         for q in queries:
             cursor = None
@@ -133,10 +158,15 @@ async def build(batch_id):
             _set(batch_id, credits_used=credits, progress=f"Found {len(pool)} new listings")
         if not pool:
             raise SourceError("No new listings matched. Try widening the price range, radius, or hunt description.")
+        # take turns between search terms so the first one can't fill every screening slot
+        by_q = {}
+        for i in order:
+            by_q.setdefault(pool[i]["query"], []).append(i)
+        order = [i for grp in itertools.zip_longest(*by_q.values()) for i in grp if i]
 
         # 3. screen thumbnails
         step = "screening thumbnails"
-        cands = [pool[i] for i in order][:45]
+        cands = [pool[i] for i in order][:MAX_SCREEN]
         _set(batch_id, status="screening", progress=f"Eyeballing {len(cands)} thumbnails")
 
         async def thumb(l):
@@ -152,13 +182,10 @@ async def build(batch_id):
         earlier = [{"phash": r["phash"], "tkey": r["tkey"] or "", "price": r["price"], "loc": r["loc"] or ""}
                    for r in db.q("SELECT phash, tkey, price, loc FROM seen WHERE profile_id=? "
                                  "AND (phash IS NOT NULL OR tkey IS NOT NULL)", (profile["id"],))]
-        everything = cands
         cands, n_dupes = dupes.collapse(cands, earlier)
         if n_dupes:
             log.info("batch %s: dropped %d reposts of the same item", batch_id, n_dupes)
-        with db.tx() as c:
-            c.executemany("INSERT OR IGNORE INTO seen (profile_id, fb_id, phash, tkey, price, loc) VALUES (?,?,?,?,?,?)",
-                          [(profile["id"], l["fb_id"], *dupes.sig(l).values()) for l in everything])
+        rejected = {}  # fb_id -> listing, judged not a fit; remembered for REJECT_DAYS
         if not cands:
             raise SourceError("Everything found was a repost of something you've already seen. "
                               "Try a new angle in your hunt or the batch extras.")
@@ -168,11 +195,14 @@ async def build(batch_id):
         fit = {k: v["fit"] for k, v in judged_thumbs.items()}
         appeal = {k: v["appeal"] for k, v in judged_thumbs.items()}
 
-        # 4. pick. "Fit" (is it even the kind of thing you're hunting?) is a hard gate for every slot,
-        # wildcards included. Weirdness only bends taste: it loosens the appeal ranking, widens the
-        # wildcard share, and relaxes how literally "the right kind of thing" is read.
-        fit_min = 55 - 20 * weird
+        # 4. choose who gets the closer look. "Fit" (is it even the kind of thing you're hunting?) is a hard gate
+        # for every slot, comets included. Weirdness only bends taste: it loosens the appeal ranking, widens the
+        # comet share, and relaxes how literally "the right kind of thing" is read.
+        fit_min = (40 if vibe_hunt else 55) - 20 * weird
         relevant = [l for l in cands if fit.get(l["fb_id"], 0) >= fit_min]
+        for l in cands:
+            if l not in relevant:
+                rejected[l["fb_id"]] = l
         if not relevant:
             raise SourceError(f"None of the {len(cands)} listings found were actually a fit for "
                               f"\"{profile['name']}\". Try different wording in your hunt description.")
@@ -180,14 +210,27 @@ async def build(batch_id):
         keyed = {l["fb_id"]: appeal.get(l["fb_id"], 0) * (1 - jitter) + rng.random() * 100 * jitter
                  for l in relevant}
         ranked = sorted(relevant, key=lambda l: -keyed[l["fb_id"]])
+        if vibe_hunt:  # no one item type may take most of the batch, however well it scores
+            cap, used, head, tail = -(-size // max(1, len(queries))) + 1, {}, [], []
+            for l in ranked:
+                if used.get(l["query"], 0) < cap:
+                    used[l["query"]] = used.get(l["query"], 0) + 1
+                    head.append(l)
+                else:
+                    tail.append(l)
+            ranked = head + tail
         share = config.EXPLORE_SHARE if batch.get("weirdness") is None else 0.05 + 0.45 * weird
-        n_explore = max(1, round(size * share)) if len(ranked) > size else 0
-        picks = ranked[:size - n_explore]
-        rest = ranked[size - n_explore:]
-        explore = rng.sample(rest, min(n_explore, len(rest)))
-        for l in explore:
+        n_comets = max(1, round(size * share)) if len(ranked) > size else 0
+        # The closer look covers more listings than the batch holds, then the blended prediction (Claude's closer
+        # look + the model of your placements) decides who is shown. Thumbnails only decide who gets looked at.
+        n_look = min(len(ranked), max(size, -(-int(size * LOOK_FACTOR * 10) // 10)))
+        regular_look = max(0, n_look - n_comets)
+        picks = ranked[:regular_look]
+        rest = ranked[regular_look:]
+        comets = rng.sample(rest, min(n_comets, len(rest)))
+        for l in comets:
             l["explore"] = 1
-        picks += explore
+        picks += comets
         backups = [l for l in ranked if l not in picks]
 
         step = "taking a closer look"
@@ -198,12 +241,15 @@ async def build(batch_id):
         details = {}
         done = 0
         total = len(picks)
+        criteria = profile.get("criteria") or []
+        must_have = profile.get("must_have") or []
 
         async def deep(l):
             nonlocal done
             async with sem:
                 d = details.get(l["fb_id"]) or {}
                 if d and d.get("is_live") is False:
+                    rejected[l["fb_id"]] = l
                     return None
                 listing = {**l, **{k: v for k, v in d.items() if v not in (None, "", [])}}
                 hit = rules.mentions(rules.listing_text(listing), rl)
@@ -211,6 +257,7 @@ async def build(batch_id):
                     dropped["mentions" if hit else "price"] += 1
                     done += 1
                     _set(batch_id, progress=f"Looked at {done} of {total}")
+                    rejected[l["fb_id"]] = l
                     return None
                 photos, imgs = [], []
                 urls = (d.get("photo_urls") or [])[:config.PHOTOS_PER_LISTING] or [l.get("thumb_url")]
@@ -226,14 +273,21 @@ async def build(batch_id):
                     judged = await brain.deep_score(profile, ctx, listing, imgs)
                 except brain.BrainError as e:
                     judged = {"score": appeal.get(l["fb_id"], 50), "fit": fit.get(l["fb_id"], 100),
-                              "checklist": [], "take": f"Couldn't get a closer look ({e}).", "tags": [],
+                              "checklist": [], "take": f"Couldn't get a closer look ({e}).", "tags": [], "guess": "",
                               "features": {}}
                 done += 1
                 _set(batch_id, progress=f"Looked at {done} of {total}")
                 if judged.get("fit", 100) < fit_min - 10:
+                    rejected[l["fb_id"]] = l
                     return None
                 if judged.get("breaks"):  # Claude says it is something you ruled out with !
                     dropped["is"] += 1
+                    rejected[l["fb_id"]] = l
+                    return None
+                eff = checklist.effect(criteria, must_have, judged["checklist"])
+                if eff["drop"]:  # a must-have answered no
+                    dropped["must"] += 1
+                    rejected[l["fb_id"]] = l
                     return None
                 tags = set(judged["tags"])
                 for t in (price_tag(listing.get("price")), size_tag(judged["features"].get("width_in")),
@@ -245,8 +299,8 @@ async def build(batch_id):
                 return {
                     "listing": listing, "photos": photos, "tags": tags, "features": judged["features"],
                     "checklist": judged["checklist"], "take": judged["take"],
-                    "claude_score": judged["score"], "model_score": m,
-                    "predicted": learn.blend(judged["score"], m, ctx["n_swipes"]),
+                    "claude_score": judged["score"], "model_score": m, "nos": eff["nos"], "guess": judged.get("guess") or "",
+                    "predicted": max(0.0, learn.blend(judged["score"], m, ctx["n_swipes"]) - eff["penalty"]),
                 }
 
         async def look(group):
@@ -257,25 +311,35 @@ async def build(batch_id):
             _set(batch_id, credits_used=credits)
             return [r for r in await asyncio.gather(*(deep(l) for l in group)) if r]
 
-        results = await look(picks)
+        def choose(found):
+            """Comets keep their place; the rest are ranked by the prediction made after the closer look."""
+            cm = [r for r in found if r["listing"].get("explore")]
+            reg = sorted((r for r in found if not r["listing"].get("explore")), key=lambda r: -r["predicted"])
+            return cm[:n_comets], reg
+
+        looked = await look(picks)
         for _round in range(3):  # top up from the next best real matches when misfits or rules drop some
-            missing = size - len(results)
+            comet_got, reg_got = choose(looked)
+            missing = size - len(comet_got) - len(reg_got)
             if missing <= 0 or not backups:
                 break
             extra, backups = backups[:missing], backups[missing:]
             total += len(extra)
-            results += await look(extra)
+            looked += await look(extra)
+        comet_got, reg_got = choose(looked)
+        results = reg_got[:max(0, size - len(comet_got))] + comet_got
         if not results:
             why = ""
             if any(dropped.values()):
                 why = (f" Your batch rules ruled out {dropped['price']} on price, {dropped['mentions']} for "
-                       f"mentioning an excluded word, and {dropped['is']} for being something you said no to.")
+                       f"mentioning an excluded word, {dropped['is']} for being something you said no to, and "
+                       f"{dropped['must']} for failing a must-have.")
             raise SourceError("Nothing survived the closer look." + why + " Try loosening the rules or the hunt.")
         rng.shuffle(results)
         with db.tx() as cx:
             for pos, r in enumerate(results):
                 l = r["listing"]
-                cx.execute(
+                cur = cx.execute(
                     "INSERT INTO listings (profile_id, batch_id, fb_id, url, title, price, price_text, location_text, "
                     "description, condition, fb_attributes, photos, query, tags, features, checklist, take, "
                     "claude_score, model_score, predicted, explore, position, created_at) "
@@ -285,6 +349,17 @@ async def build(batch_id):
                      db.dumps(l.get("fb_attributes") or []), db.dumps(r["photos"]), l.get("query"),
                      db.dumps(r["tags"]), db.dumps(r["features"]), db.dumps(r["checklist"]), r["take"],
                      r["claude_score"], r["model_score"], r["predicted"], l.get("explore", 0), pos, db.now()))
+                cx.execute("INSERT OR REPLACE INTO predictions (listing_id, profile_id, batch_id, claude_score, model_score, "
+                           "predicted, checklist_nos, guess_text, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                           (cur.lastrowid, profile["id"], batch_id, r["claude_score"], r["model_score"], r["predicted"], r["nos"],
+                            r["guess"], db.now()))
+            # only what was shown (or judged not a fit) is remembered, in the same transaction as the batch itself
+            cx.executemany("INSERT OR REPLACE INTO seen (profile_id, fb_id, phash, tkey, price, loc, state, at) "
+                           "VALUES (?,?,?,?,?,?,?,?)",
+                           [(profile["id"], r["listing"]["fb_id"], *dupes.sig(r["listing"]).values(), "shown", db.now())
+                            for r in results] +
+                           [(profile["id"], i, *dupes.sig(l).values(), "rejected", db.now())
+                            for i, l in rejected.items() if i not in {r["listing"]["fb_id"] for r in results}])
         _set(batch_id, status="ready", size=len(results), progress="Ready", ready_at=db.now(),
              credits_used=credits)
         log.info("batch %s ready: %d listings, %d credits, queries %s, rules dropped %s", batch_id, len(results),

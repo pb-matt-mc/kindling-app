@@ -1,25 +1,25 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-display="browser">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-  <meta name="theme-color" content="#16110e">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#0B1440">
+  <meta name="color-scheme" content="dark">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
-  <title>Kindling</title>
+  <meta name="apple-mobile-web-app-title" content="Orbit">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Orbit</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/orbit.css">
 </head>
 <body>
   <div id="app"></div>
-  <div id="sheet-root"></div>
-  <div id="toast" class="toast" hidden></div>
-  <script src="/static/vendor/d3.min.js"></script>
-  <script type="module" src="/static/app.js"></script>
+  <div id="layer"></div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/static/orbit-math.js"></script>
+  <script type="module" src="/static/orbit.js"></script>
 </body>
 </html>

@@ -3,3 +3,7 @@ data/
 __pycache__/
 *.pyc
 .venv/
+.venv-ui/
+specs/ui-responsive-overhaul/
+scripts/perf/last.json
+.coverage

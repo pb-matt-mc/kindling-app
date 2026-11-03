@@ -11,7 +11,8 @@ import time
 
 from . import db
 
-COOKIE = "kindling_session"
+COOKIE = "orbit_session"
+LEGACY_COOKIE = "kindling_session"   # devices signed in before the rename keep working; they are moved to the new cookie on their next request
 SESSION_DAYS = 365
 INVITE_DAYS = 7
 DEFAULT_FRIEND_CAP = 3.0  # USD of Claude per week
@@ -22,6 +23,10 @@ current_user = contextvars.ContextVar("current_user", default=None)
 
 class AuthError(Exception):
     pass
+
+
+def token_from(cookies):
+    return cookies.get(COOKIE) or cookies.get(LEGACY_COOKIE)
 
 
 def _h(s):
@@ -65,10 +70,16 @@ def redeem(code, name, device=""):
         name = " ".join((name or "").split())[:40]
         if not name:
             raise AuthError("Add your name so your hunts are yours.")
+    # claim the code first, atomically, so two simultaneous redeems can't both win
+    with db.tx() as c:
+        if c.execute("UPDATE invites SET used_at=? WHERE code_hash=? AND used_at IS NULL",
+                     (db.now(), inv["code_hash"])).rowcount != 1:
+            raise AuthError("That code has already been used. Ask for a new one.")
+    if not inv["for_user_id"]:
         uid = db.ex("INSERT INTO users (name, role, claude_cap, created_at) VALUES (?,?,?,?)",
                     (name, inv["role"], inv["claude_cap"], db.now()))
         db.new_profile(uid, "My hunt")
-    db.ex("UPDATE invites SET used_by=?, used_at=? WHERE code_hash=?", (uid, db.now(), inv["code_hash"]))
+    db.ex("UPDATE invites SET used_by=? WHERE code_hash=?", (uid, inv["code_hash"]))
     return db.q1("SELECT * FROM users WHERE id=?", (uid,)), new_session(uid, device)
 
 

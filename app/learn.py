@@ -27,7 +27,7 @@ CRYSTAL_FADE = 0.5     # each older crystal counts this much as the next newer o
 
 def swiped(profile_id, batch_id=None, evidence_only=False):
     """Swiped listings currently in the web. evidence_only skips ones whose taste is already crystallized."""
-    sql = ("SELECT l.*, s.verdict, s.rank, s.manual, s.swiped_at FROM listings l "
+    sql = ("SELECT l.*, s.verdict, s.rank, s.manual, s.swiped_at, COALESCE(s.weight, 1.0) weight FROM listings l "
            "JOIN swipes s ON s.listing_id = l.id WHERE l.profile_id=? AND l.state='web'")
     args = [profile_id]
     if evidence_only:
@@ -55,22 +55,24 @@ def evidence(rows):
     """Raw per-trait evidence from listing rows, relative to their own mean. What a crystal stores."""
     if not rows:
         return [], 0.5
-    mean = sum(r["rank"] for r in rows) / len(rows)
+    wsum = sum(r.get("weight", 1.0) for r in rows) or 1.0
+    mean = sum(r["rank"] * r.get("weight", 1.0) for r in rows) / wsum
     acc = defaultdict(lambda: {"sum": 0.0, "n": 0, "likes": 0})
     for r in rows:
+        w = r.get("weight", 1.0)
         for t in r["tags"] or []:
             a = acc[t]
-            a["sum"] += r["rank"] - mean
-            a["n"] += 1
-            a["likes"] += r["verdict"] == "like"
+            a["sum"] += (r["rank"] - mean) * w
+            a["n"] += w
+            a["likes"] += w * (r["verdict"] == "like")
     return [{"tag": t, **a} for t, a in acc.items()], mean
 
 
 def weights(profile_id):
     rows = swiped(profile_id, evidence_only=True)
     cs = crystals(profile_id)
-    total = sum(r["rank"] for r in rows)
-    count = float(len(rows))
+    total = sum(r["rank"] * r.get("weight", 1.0) for r in rows)
+    count = float(sum(r.get("weight", 1.0) for r in rows))
     for c in cs:
         total += c["mean"] * c["n_listings"] * c["factor"]
         count += c["n_listings"] * c["factor"]
@@ -79,11 +81,12 @@ def weights(profile_id):
     mean = total / count
     acc = defaultdict(lambda: {"sum": 0.0, "n": 0.0, "likes": 0.0})
     for r in rows:
+        w = r.get("weight", 1.0)
         for t in r["tags"] or []:
             a = acc[t]
-            a["sum"] += r["rank"] - mean
-            a["n"] += 1
-            a["likes"] += r["verdict"] == "like"
+            a["sum"] += (r["rank"] - mean) * w
+            a["n"] += w
+            a["likes"] += w * (r["verdict"] == "like")
     for c in cs:
         f = c["factor"]
         for e in c["weights"] or []:
@@ -209,7 +212,8 @@ def batch_stats(profile_id, batch_id):
 def batch_accuracy(profile_id):
     """Per finished batch: how often the pre-swipe prediction matched your swipe."""
     out = []
-    for b in db.q("SELECT id, number, stats FROM batches WHERE profile_id=? AND status='done' ORDER BY number",
+    for b in db.q("SELECT id, number, stats FROM batches WHERE profile_id=? AND status='done' "
+                  "AND progress!='Vibe hone' ORDER BY number",  # a vibe hone had no prediction to check
                   (profile_id,)):
         st = b["stats"] or batch_stats(profile_id, b["id"])
         if not st:

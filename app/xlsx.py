@@ -36,49 +36,55 @@ def _thumb(photo_path):
 
 
 def build(cols, rows, photos, sheet_title="Kindling"):
-    """cols: header names. rows: list of value lists (column 2 is the link). photos: first photo path per row."""
+    """cols: header names. rows: list of value lists (column 2 is the link). photos: first photo path per row.
+
+    Photos float over their row, pinned to the cell. Excel, Numbers and Files show them. Google Sheets
+    drops them on import, and its import turns Excel's "Place in cell" pictures into #VALUE!, so don't use those.
+    """
     try:
-        from openpyxl import Workbook
-        from openpyxl.drawing.image import Image as XLImage
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-        import PIL  # noqa: F401  openpyxl needs Pillow for images
+        import xlsxwriter
+        import PIL  # noqa: F401  needed to read the photos
     except ImportError as e:
-        raise XlsxUnavailable("Excel export needs the openpyxl and Pillow packages on the server "
+        raise XlsxUnavailable("Excel export needs the xlsxwriter and Pillow packages on the server "
                               "(pip install -r requirements.txt).") from e
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "".join(ch for ch in sheet_title if ch not in '[]:*?/\\')[:31] or "Kindling"
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True, "strings_to_formulas": False, "strings_to_urls": False})
+    title = "".join(ch for ch in sheet_title if ch not in '[]:*?/\\')[:31] or "Kindling"
+    ws = wb.add_worksheet(title)
+    head = wb.add_format({"bold": True, "font_color": "#FFFFFF", "bg_color": "#2A1F19", "valign": "vcenter", "text_wrap": True})
+    body = wb.add_format({"valign": "vcenter", "text_wrap": True})
+    link = wb.add_format({"valign": "vcenter", "font_color": "#1A73E8", "underline": 1})
+
     header = ["Photo"] + list(cols)
-    ws.append(header)
-    for c in ws[1]:
-        c.font = Font(bold=True, color="FFFFFF")
-        c.fill = PatternFill("solid", fgColor="2A1F19")
-        c.alignment = Alignment(vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 30
-    ws.freeze_panes = "B2"
+    ws.set_row(0, 30)
+    for i, name in enumerate(header):
+        ws.write_string(0, i, name, head)
+    ws.freeze_panes(1, 1)
+    widths = {"Photo": 17, "Name": 38, "Link": 16, "Price": 10, "Top 5 qualities": 42, "Listing area": 22}
+    for i, name in enumerate(header):
+        ws.set_column(i, i, widths.get(name, 14))
 
-    widths = {"Photo": 17, "Name": 38, "Link": 16, "Price": 10, "Top 5 qualities": 42}
-    for i, name in enumerate(header, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = widths.get(name, 14)
-
-    top = Alignment(vertical="center", wrap_text=True)
-    for r_i, (row, photo) in enumerate(zip(rows, photos), start=2):
-        ws.append([""] + list(row))
-        ws.row_dimensions[r_i].height = ROW_PT
-        for c in ws[r_i]:
-            c.alignment = top
-        link_cell = ws.cell(row=r_i, column=3)
-        if link_cell.value:
-            link_cell.hyperlink = link_cell.value
-            link_cell.value = "Open listing"
-            link_cell.font = Font(color="1A73E8", underline="single")
+    for r_i, (row, photo) in enumerate(zip(rows, photos), start=1):
+        ws.set_row(r_i, ROW_PT)
+        for c_i, v in enumerate(row, start=1):
+            if c_i == 2 and v:  # the Link column
+                ws.write_url(r_i, c_i, str(v), link, "Open listing")
+            elif isinstance(v, str):
+                ws.write_string(r_i, c_i, v, body)  # listing titles come from sellers; never let one become a formula
+            elif v is None or v == "":
+                ws.write_blank(r_i, c_i, None, body)
+            else:
+                ws.write_number(r_i, c_i, v, body)
         data = _thumb(photo)
         if data:
-            img = XLImage(io.BytesIO(data))
-            ws.add_image(img, f"A{r_i}")
-
-    buf = io.BytesIO()
-    wb.save(buf)
+            ws.insert_image(r_i, 0, "photo.jpg", {"image_data": io.BytesIO(data), "object_position": 1, "x_offset": 3, "y_offset": 3})
+    wb.close()
     return buf.getvalue()
+
+
+def formula_safe(v):
+    """For CSV/TSV: a cell a spreadsheet would read as a formula gets a leading quote."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
